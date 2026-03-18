@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     """Parses command line configuration arguments for model evaluation."""
     parser = argparse.ArgumentParser(description="Evaluate Coarse Quad network (Stage 1).")
     parser.add_argument('--weights', type=str, required=True, help="Path to the trained model checkpoint (.pt) or TorchScript model.")
-    parser.add_argument('--val_images', type=str, default='../../crop-dataset-eitan-yolo/images/val', help="Directory containing validation images.")
-    parser.add_argument('--val_annotations', type=str, default='../../crop-dataset-eitan-yolo/annotations/val.json', help="Path to the COCO validation annotations JSON.")
+    parser.add_argument('--val_images', type=str, default='../crop-dataset-eitan-yolo/images/val', help="Directory containing validation images.")
+    parser.add_argument('--val_annotations', type=str, default='../crop-dataset-eitan-yolo/annotations/val.json', help="Path to the COCO validation annotations JSON.")
     parser.add_argument('--input_size', type=int, default=384, help="Model input resolution (square dim).")
     parser.add_argument('--batch_size', type=int, default=1, help="Evaluation batch size.")
     parser.add_argument('--num_workers', type=int, default=0, help="Number of PyTorch data loading workers.")

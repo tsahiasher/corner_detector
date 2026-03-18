@@ -45,9 +45,9 @@ Use this 4-stage design as the default:
 ## Dataset assumptions
 
 Assume this dataset layout unless the user explicitly says otherwise:
-- Training images: `../../crop-dataset-eitan-yolo/images/train`
-- Validation images: `../../crop-dataset-eitan-yolo/images/val`
-- Validation annotations: `../../crop-dataset-eitan-yolo/annotations/val.json`
+- Training images: `../crop-dataset-eitan-yolo/images/train`
+- Validation images: `../crop-dataset-eitan-yolo/images/val`
+- Validation annotations: `../crop-dataset-eitan-yolo/annotations/val.json`
 
 Dataset rules:
 - Training annotations come from YOLO txt label files alongside the training images. Do not assume `train.json` exists.

@@ -49,9 +49,9 @@ def setup_logging(log_file: str) -> logging.Logger:
 def parse_args() -> argparse.Namespace:
     """Parses command line configuration arguments."""
     parser = argparse.ArgumentParser(description="Train Coarse Quad Net (Stage 1).")
-    parser.add_argument('--train_images', type=str, default='../../crop-dataset-eitan-yolo/images/train', help="Path to training images directory.")
-    parser.add_argument('--val_images', type=str, default='../../crop-dataset-eitan-yolo/images/val', help="Path to validation images directory.")
-    parser.add_argument('--val_annotations', type=str, default='../../crop-dataset-eitan-yolo/annotations/val.json', help="Path to validation annotations JSON file.")
+    parser.add_argument('--train_images', type=str, default='../crop-dataset-eitan-yolo/images/train', help="Path to training images directory.")
+    parser.add_argument('--val_images', type=str, default='../crop-dataset-eitan-yolo/images/val', help="Path to validation images directory.")
+    parser.add_argument('--val_annotations', type=str, default='../crop-dataset-eitan-yolo/annotations/val.json', help="Path to validation annotations JSON file.")
     parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs.")
     parser.add_argument('--batch_size', type=int, default=16, help="Training batch size.")
     parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate.")
