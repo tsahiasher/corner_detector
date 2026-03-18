@@ -35,7 +35,7 @@
 
 
 ## Scripts
-python train.py --epochs 50 --batch_size 480
+python train.py --epochs 50 --batch_size 384
 
 python test.py --weights runs/20260318_125932/checkpoints/best.pt
 
