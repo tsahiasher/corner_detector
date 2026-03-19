@@ -92,7 +92,8 @@ def main() -> None:
         # without dynamic loops or branch conditions dependent on dataset contents.
         try:
             with torch.inference_mode():
-                exported_model = torch.jit.trace(model, dummy_input)
+                # Passing strict=False is necessary because the model returns a dictionary of outputs.
+                exported_model = torch.jit.trace(model, dummy_input, strict=False)
             logger.info("Successfully traced the model graph.")
         except Exception as e:
             logger.error(f"Failed to trace model: {e}")
@@ -117,27 +118,24 @@ def main() -> None:
     if args.verify:
         logger.info(f"--- Running Execution Verification ({args.verify_runs} runs) ---")
         tolerance = 1e-4
-        max_score_err = 0.0
-        max_corner_err = 0.0
+        max_err = 0.0
         
         with torch.inference_mode():
             for i in range(args.verify_runs):
                 v_input = torch.randn(*input_shape).to(device)
                 
                 # Eager vs Traced checks 
-                eager_score, eager_corners = model(v_input)
-                traced_score, traced_corners = exported_model(v_input)
+                eager_out = model(v_input)
+                traced_out = exported_model(v_input)
                 
-                score_err = torch.abs(eager_score - traced_score).max().item()
-                corner_err = torch.abs(eager_corners - traced_corners).max().item()
+                # Check all dict keys
+                for key in eager_out:
+                    err = torch.abs(eager_out[key] - traced_out[key]).max().item()
+                    max_err = max(max_err, err)
                 
-                max_score_err = max(max_score_err, score_err)
-                max_corner_err = max(max_corner_err, corner_err)
-                
-        logger.info(f"Max Absolute Score Error:   {max_score_err:.6e}")
-        logger.info(f"Max Absolute Corners Error: {max_corner_err:.6e}")
+        logger.info(f"Max Absolute Error: {max_err:.6e}")
         
-        if max(max_score_err, max_corner_err) > tolerance:
+        if max_err > tolerance:
             logger.warning(f"Precision degradation during export exceeds threshold ({tolerance})!")
         else:
             logger.info("Equivalence strict check Passed: Traced model mathematically matches eager graph.")
@@ -145,16 +143,17 @@ def main() -> None:
     # 4. Reload Reliability Check
     logger.info("--- Performing Reload Sanity Check ---")
     try:
-        # We explicitly map it back to CPU upon reload, as standard edge deployments target CPU hardware 
         reloaded_model = torch.jit.load(args.output, map_location='cpu')
         reloaded_model.eval()
         
         cpu_input = torch.randn(*input_shape).to('cpu')
         with torch.inference_mode():
-            score_out, corner_out = reloaded_model(cpu_input)
+            out_dict = reloaded_model(cpu_input)
             
         logger.info(f"Successfully reloaded architecture file bounds onto 'cpu'.")
-        logger.info(f"Reloaded outputs matching expected shapes -> Score: {score_out.shape}, Corners: {corner_out.shape}")
+        logger.info(f"Reloaded outputs: {list(out_dict.keys())}")
+        for k, v in out_dict.items():
+            logger.info(f"  {k:15s}: {v.shape}")
         
     except Exception as e:
         logger.error(f"Reload Sanity Check Failed! Traced model might execute unpredictably: {e}")

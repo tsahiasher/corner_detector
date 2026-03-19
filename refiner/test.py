@@ -1,19 +1,258 @@
-"""
-Stage 2: Refiner Evaluation Script (Placeholder)
-
-TODO: Implement metrics calculation for the high-precision patch refiner.
-Output telemetry maps back natively inside the `runs/refiner/` evaluation namespace dynamically.
-"""
-
-import sys
 import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import logging
+import csv
+from datetime import datetime
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from refiner.models.patch_refiner import PatchRefinerNet
+from refiner.datasets.refine_keypoint_dataset import RefineKeypointDataset
+from common.checkpoint import load_checkpoint
+from common.seed import set_seed
+from common.metrics import WingLoss
+from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
+
+
+def setup_logging(log_file: str) -> logging.Logger:
+    """Configures production-quality logging to both console and file."""
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    logger = logging.getLogger('refiner_eval')
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    c_handler = logging.StreamHandler()
+    c_handler.setFormatter(formatter)
+    logger.addHandler(c_handler)
+
+    f_handler = logging.FileHandler(log_file)
+    f_handler.setFormatter(formatter)
+    logger.addHandler(f_handler)
+
+    logger.info(f"Evaluation logging initialized. Writing logs to {log_file}")
+    return logger
+
+
+def parse_args() -> argparse.Namespace:
+    """Parses command line arguments for refiner evaluation."""
+    parser = argparse.ArgumentParser(description="Evaluate Patch Refiner Net (Stage 2).")
+    parser.add_argument('--weights', type=str, required=True, help="Path to refiner checkpoint (.pt) or TorchScript model.")
+    parser.add_argument('--val_images', type=str, default='../crop-dataset-eitan-yolo/images/val', help="Directory with validation images.")
+    parser.add_argument('--patch_size', type=int, default=96, help="Side length of corner patches.")
+    parser.add_argument('--batch_size', type=int, default=1, help="Evaluation batch size.")
+    parser.add_argument('--num_workers', type=int, default=0, help="Data loading workers.")
+    add_device_args(parser, default='auto')
+    parser.add_argument('--run_dir', type=str, default='', help="Explicit run directory. If empty, inferred from weights path.")
+    parser.add_argument('--save_csv', action='store_true', default=True, help="Save per-image metrics to CSV.")
+    parser.add_argument('--save_vis', action='store_true', default=True, help="Save patch visualizations for worst cases.")
+    parser.add_argument('--max_vis', type=int, default=20, help="Max visualizations to save.")
+    parser.add_argument('--report_worst_k', type=int, default=10, help="Number of worst images in report.")
+    return parser.parse_args()
+
+
+def save_patch_visualization(patches: torch.Tensor, pred: torch.Tensor, target: torch.Tensor,
+                             img_path: str, out_dir: str, patch_size: int) -> None:
+    """Draws predicted (orange) and target (green) points on each patch and saves side-by-side.
+
+    Args:
+        patches (torch.Tensor): Corner patches [4, 3, ps, ps].
+        pred (torch.Tensor): Predicted positions [4, 2] normalized.
+        target (torch.Tensor): Target positions [4, 2] normalized.
+        img_path (str): Original image path for naming.
+        out_dir (str): Output directory.
+        patch_size (int): Patch side length.
+    """
+    try:
+        import cv2
+        import numpy as np
+        from common.transforms import denormalize_image
+    except ImportError:
+        return
+
+    corner_labels = ["TL", "TR", "BR", "BL"]
+    row_imgs = []
+
+    for i in range(4):
+        img = denormalize_image(patches[i].cpu()).permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 1)
+        img = (img * 255).astype(np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        px_pred = (pred[i].cpu().numpy() * patch_size).astype(int)
+        px_target = (target[i].cpu().numpy() * patch_size).astype(int)
+
+        cv2.circle(img, tuple(px_target), 4, (0, 255, 0), -1)   # GT green
+        cv2.circle(img, tuple(px_pred), 4, (0, 165, 255), -1)   # Pred orange
+        label = f"{i}:{corner_labels[i]}"
+        cv2.putText(img, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        row_imgs.append(img)
+
+    combined = np.hstack(row_imgs)
+    name = os.path.basename(img_path)
+    cv2.imwrite(os.path.join(out_dir, f"refine_vis_{name}"), combined)
+
 
 def main() -> None:
-    print("Stage 2 (Refiner) Testing Pipeline is pending implementation.")
-    
+    """Main refiner evaluation function."""
+    args = parse_args()
+
+    if args.run_dir:
+        run_dir = args.run_dir
+    else:
+        weights_dir = os.path.dirname(os.path.abspath(args.weights))
+        parent_dir = os.path.dirname(weights_dir)
+        if os.path.basename(weights_dir) == 'checkpoints':
+            run_dir = parent_dir
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = os.path.join('.', 'runs', 'refiner', f"eval_{timestamp}")
+
+    os.makedirs(run_dir, exist_ok=True)
+    log_dir = os.path.join(run_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+
+    logger = setup_logging(os.path.join(log_dir, 'eval.log'))
+    logger.info(f"Evaluation run directory: {run_dir}")
+
+    set_seed(42)
+    device = resolve_device(args.device)
+    log_device_info(device, args.device, logger)
+
+    logger.info("Loading validation dataset (GT rectification, no jitter)...")
+    val_dataset = RefineKeypointDataset(
+        args.val_images, is_train=False, jitter_px=0.0, patch_size=args.patch_size
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    # Load model
+    is_torchscript = False
+    try:
+        model = torch.jit.load(args.weights, map_location=device)
+        is_torchscript = True
+        logger.info("Loaded TorchScript model.")
+    except Exception:
+        model = PatchRefinerNet().to(device)
+        load_checkpoint(model, None, None, args.weights, device=device)
+        logger.info("Loaded eager PyTorch checkpoint.")
+
+    model.eval()
+
+    results = []
+    total_infer_time = 0.0
+    total_patches = 0
+    t_start = sync_time()
+
+    logger.info("Running evaluation...")
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Evaluating", leave=False):
+            batch = move_batch_to_device(batch, device)
+            patches = batch['patches']   # [B, 4, 3, ps, ps]
+            targets = batch['targets']   # [B, 4, 2]
+
+            B = patches.size(0)
+            patches_flat = patches.view(B * 4, 3, args.patch_size, args.patch_size)
+            targets_flat = targets.view(B * 4, 2)
+
+            t_infer = sync_time()
+            pred = model(patches_flat)  # [B*4, 2]
+            infer_time = sync_time() - t_infer
+
+            total_infer_time += infer_time
+            total_patches += patches_flat.size(0)
+
+            pred_4 = pred.view(B, 4, 2)
+            targets_4 = targets.view(B, 4, 2)
+
+            for b in range(B):
+                diff = (pred_4[b] - targets_4[b]) * args.patch_size
+                dist = torch.norm(diff, dim=-1)  # [4]
+                img_path = batch['img_path'][b] if isinstance(batch['img_path'], (list, tuple)) else batch['img_path']
+                results.append({
+                    'img_path': img_path,
+                    'err_tl': dist[0].item(),
+                    'err_tr': dist[1].item(),
+                    'err_br': dist[2].item(),
+                    'err_bl': dist[3].item(),
+                    'mean_err': dist.mean().item(),
+                    'pred': pred_4[b].cpu(),
+                    'target': targets_4[b].cpu(),
+                    'patches': patches[b].cpu(),
+                })
+
+    total_eval_time = sync_time() - t_start
+    results_sorted = sorted(results, key=lambda x: x['mean_err'], reverse=True)
+
+    all_errs = torch.tensor([r['mean_err'] for r in results])
+    err_tl = torch.tensor([r['err_tl'] for r in results])
+    err_tr = torch.tensor([r['err_tr'] for r in results])
+    err_br = torch.tensor([r['err_br'] for r in results])
+    err_bl = torch.tensor([r['err_bl'] for r in results])
+
+    avg_infer_ms = (total_infer_time / total_patches) * 1000 if total_patches > 0 else 0
+
+    # === Report ===
+    logger.info("\n" + "=" * 50)
+    logger.info("=== REFINER EVALUATION RESULTS ===")
+    logger.info("=" * 50)
+    logger.info(f"Model: {args.weights}")
+    logger.info(f"Images evaluated: {len(results)}")
+    logger.info(f"Total patches: {total_patches}")
+
+    logger.info("\n--- Timing ---")
+    logger.info(f"Total eval time: {total_eval_time:.2f} s")
+    logger.info(f"Avg inference per patch: {avg_infer_ms:.2f} ms")
+
+    logger.info("\n--- Sub-pixel errors (within patch, px) ---")
+    logger.info(f"Mean: {all_errs.mean().item():.3f} px")
+    logger.info(f"Median: {all_errs.median().item():.3f} px")
+
+    logger.info("\n--- Per-Corner Mean errors (px) ---")
+    logger.info(f"TL: {err_tl.mean().item():.3f} | TR: {err_tr.mean().item():.3f}")
+    logger.info(f"BR: {err_br.mean().item():.3f} | BL: {err_bl.mean().item():.3f}")
+
+    logger.info("\n--- Sub-pixel Accuracy ---")
+    for t in [1, 2, 3, 5]:
+        acc = (all_errs < t).float().mean().item() * 100
+        logger.info(f"<{t} px: {acc:.1f}%")
+
+    logger.info("\n--- Worst-K ---")
+    for k in range(min(args.report_worst_k, len(results_sorted))):
+        r = results_sorted[k]
+        logger.info(f"[{k+1}] {r['mean_err']:.2f} px | {os.path.basename(r['img_path'])}")
+
+    # CSV
+    if args.save_csv:
+        csv_path = os.path.join(run_dir, 'refiner_eval_results.csv')
+        try:
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['img_path', 'mean_err', 'err_tl', 'err_tr', 'err_br', 'err_bl'])
+                for r in results_sorted:
+                    writer.writerow([r['img_path'], r['mean_err'], r['err_tl'], r['err_tr'], r['err_br'], r['err_bl']])
+            logger.info(f"\nCSV saved: {csv_path}")
+        except Exception as e:
+            logger.error(f"Failed to save CSV: {e}")
+
+    # Visualizations
+    if args.save_vis:
+        vis_dir = os.path.join(run_dir, "visualizations")
+        os.makedirs(vis_dir, exist_ok=True)
+        drawn = 0
+        for r in results_sorted:
+            if drawn >= args.max_vis:
+                break
+            save_patch_visualization(r['patches'], r['pred'], r['target'], r['img_path'], vis_dir, args.patch_size)
+            drawn += 1
+        logger.info(f"Saved {drawn} visualizations to: {vis_dir}")
+
+
 if __name__ == "__main__":
     main()

@@ -4,7 +4,7 @@ import logging
 import torch
 from torch.utils.data import Dataset
 from PIL import Image, UnidentifiedImageError
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from common.transforms import get_train_transforms
 
@@ -72,19 +72,50 @@ class COCOValDataset(Dataset):
             y = kps[i*3 + 1] / h
             keypoints.append([x, y])
             
-        import math
-        cx = sum([pt[0] for pt in keypoints]) / 4.0
-        cy = sum([pt[1] for pt in keypoints]) / 4.0
-        def angle_from_center(pt: List[float]) -> float:
-            return math.atan2(pt[1] - cy, pt[0] - cx)
-            
-        keypoints = sorted(keypoints, key=angle_from_center)
-            
         image_t, keypoints_t = self.transforms(image, keypoints)
         
+        # Generate dense geometric targets (96x96 for v2 boost)
+        mask_t, edges_t = self.generate_mask_and_edges(keypoints_t, size=96)
+        
         return {
+            'index': idx,
             'image': image_t,
             'corners': torch.tensor(keypoints_t, dtype=torch.float32),
+            'mask': mask_t,
+            'edges': edges_t,
             'img_path': img_path,
-            'orig_size': (w, h)
+            'orig_width': torch.tensor(float(w), dtype=torch.float32),
+            'orig_height': torch.tensor(float(h), dtype=torch.float32)
         }
+
+    def generate_mask_and_edges(self, keypoints: List[List[float]], size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generates a binary mask and a Gaussian boundary edge map from 4 corners.
+        
+        Args:
+            keypoints (List[List[float]]): Normalized corners [4, 2].
+            size (int): Target spatial resolution (e.g. 96).
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (mask, Gaussian edges) tensors of shape [1, size, size].
+        """
+        import cv2
+        import numpy as np
+        
+        mask = np.zeros((size, size), dtype=np.uint8)
+        edges = np.zeros((size, size), dtype=np.uint8)
+        
+        # Scale to target size
+        pts = (np.array(keypoints) * size).astype(np.int32)
+        
+        # 1. Generate filled polygon mask
+        cv2.fillPoly(mask, [pts], 255)
+        
+        # 2. Generate Gaussian boundary (Performance Boost v2)
+        cv2.polylines(edges, [pts], isClosed=True, color=255, thickness=1)
+        edges_f = cv2.GaussianBlur(edges.astype(np.float32), (3, 3), sigmaX=0.8)
+        
+        # Convert to float tensors [1, H, W] in [0, 1]
+        mask_t = torch.from_numpy(mask).float().unsqueeze(0) / 255.0
+        edges_t = torch.from_numpy(edges_f).float().unsqueeze(0) / 255.0
+        
+        return mask_t, edges_t

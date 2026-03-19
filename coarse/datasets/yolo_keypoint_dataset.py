@@ -4,7 +4,7 @@ import logging
 import torch
 from torch.utils.data import Dataset
 from PIL import Image, UnidentifiedImageError
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from common.yolo_labels import parse_yolo_keypoint_line
 from common.transforms import get_train_transforms
@@ -48,6 +48,41 @@ class YOLOKeypointDataset(Dataset):
         label_dir = os.path.join(root_dir, 'labels', split_name)
         return os.path.join(label_dir, name + ".txt")
 
+    def generate_mask_and_edges(self, keypoints: List[List[float]], size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generates a binary mask and a Gaussian boundary edge map from 4 corners.
+        
+        Args:
+            keypoints (List[List[float]]): Normalized corners [4, 2].
+            size (int): Target spatial resolution (e.g. 96).
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (mask, Gaussian edges) tensors of shape [1, size, size].
+        """
+        import cv2
+        import numpy as np
+        
+        mask = np.zeros((size, size), dtype=np.uint8)
+        edges = np.zeros((size, size), dtype=np.uint8)
+        
+        # Scale to target size
+        pts = (np.array(keypoints) * size).astype(np.int32)
+        
+        # 1. Generate filled polygon mask
+        cv2.fillPoly(mask, [pts], 255)
+        
+        # 2. Generate Gaussian boundary (Performance Boost v2)
+        # Draw 1px binary line first
+        cv2.polylines(edges, [pts], isClosed=True, color=255, thickness=1)
+        # Apply Gaussian blur to create a smooth falloff (3px effective width)
+        edges_f = cv2.GaussianBlur(edges.astype(np.float32), (3, 3), sigmaX=0.8)
+        # Normalize back to [0, 255] for consistency if needed, but we divide by 255 later
+        
+        # Convert to float tensors [1, H, W] in [0, 1]
+        mask_t = torch.from_numpy(mask).float().unsqueeze(0) / 255.0
+        edges_t = torch.from_numpy(edges_f).float().unsqueeze(0) / 255.0
+        
+        return mask_t, edges_t
+
     def __len__(self) -> int:
         """Returns bounds configuration size limits."""
         return len(self.image_paths)
@@ -62,14 +97,15 @@ class YOLOKeypointDataset(Dataset):
             Dict[str, Any]: Dictionary containing:
                 - 'image': Preprocessed image tensor.
                 - 'corners': Tensor of normalized keypoint coordinates.
-                - 'img_path': Original image path for debugging/logging.
-                
-        Raises:
-            Exception: If an underlying unrecoverable file error occurs.
+                - 'mask': Card area mask [1, 48, 48].
+                - 'edges': Card boundary edges [1, 48, 48].
+                - 'img_path': Original image path.
+                - 'orig_width', 'orig_height': Original image size.
         """
         img_path = self.image_paths[idx]
         try:
             image = Image.open(img_path).convert("RGB")
+            orig_w, orig_h = image.size
         except (UnidentifiedImageError, OSError) as e:
             logger.error(f"Dataset access read stream error at {img_path}: {e}")
             raise e
@@ -89,12 +125,20 @@ class YOLOKeypointDataset(Dataset):
                 logger.error(f"Failed to read/parse YOLO annotation file at {label_path}: {e}")
         
         if not keypoints:
-            raise ValueError(f"Missing or malformed YOLO annotation for image: {img_path}. Failing loudly to protect dataset bounding quality limits.")
+            raise ValueError(f"Missing or malformed YOLO annotation for image: {img_path}.")
             
         image_t, keypoints_t = self.transforms(image, keypoints)
         
+        # Generate dense geometric targets (96x96 for v2 boost)
+        mask_t, edges_t = self.generate_mask_and_edges(keypoints_t, size=96)
+        
         return {
+            'index': idx,
             'image': image_t,
             'corners': torch.tensor(keypoints_t, dtype=torch.float32),
-            'img_path': img_path
+            'mask': mask_t,
+            'edges': edges_t,
+            'img_path': img_path,
+            'orig_width': torch.tensor(float(orig_w)),
+            'orig_height': torch.tensor(float(orig_h))
         }

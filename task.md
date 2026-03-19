@@ -35,11 +35,11 @@
 
 
 ## Scripts
-python train.py --epochs 50 --batch_size 480
+python coarse\train.py --epochs 50 --batch_size 480
 
-python test.py --weights runs/20260318_125932/checkpoints/best.pt
+python coarse\test.py --weights coarse\runs\20260319_180637\checkpoints\best.pt
 
-python export_torchscript.py --weights runs/20260318_125932/checkpoints/best.pt --output runs/20260318_125932/checkpoints/coarse_quad_net.pt
+python coarse\export_torchscript.py --weights coarse\runs\20260319_180637\checkpoints\best.pt --output coarse\runs\20260319_180637\checkpoints\coarse_quad_net.pt
 
-python run_torchscript_image.py --model runs/20260318_125932/checkpoints/coarse_quad_net.pt --image your_id_card.jpg
+python coarse\run_torchscript_image.py --model coarse\runs\20260319_180637\checkpoints\coarse_quad_net.pt --image your_id_card.jpg
 

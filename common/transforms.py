@@ -1,3 +1,6 @@
+import math
+import random
+
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -76,27 +79,73 @@ class Normalize:
         """
         return TF.normalize(img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), keypoints
 
+
+class RandomRotation:
+    """Randomly rotates the image and keypoints by a small angle.
+
+    The same rotation is applied to both the image and its normalized keypoint
+    coordinates so that semantic keypoint identity is preserved (index 0 stays
+    the card's physical Top-Left).
+
+    Keypoints are rotated around the image center (0.5, 0.5) in normalized
+    coordinates and clamped to [0, 1] afterwards.
+
+    Args:
+        max_angle (float): Maximum absolute rotation angle in degrees.
+    """
+    def __init__(self, max_angle: float = 15.0) -> None:
+        self.max_angle = max_angle
+
+    def __call__(self, img: Image.Image, keypoints: List[List[float]]) -> Tuple[Image.Image, List[List[float]]]:
+        """Forward pass.
+
+        Args:
+            img (Image.Image): Input Image.
+            keypoints (List[List[float]]): Normalized keypoints in [0, 1].
+
+        Returns:
+            Tuple[Image.Image, List[List[float]]]: Rotated image and keypoints.
+        """
+        angle = random.uniform(-self.max_angle, self.max_angle)
+
+        # Rotate image (PIL rotates counter-clockwise for positive angles)
+        img = TF.rotate(img, angle, fill=0)
+
+        # Rotate keypoints around center (0.5, 0.5)
+        rad = math.radians(-angle)  # negate because PIL rotates CCW
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+
+        rotated_kps: List[List[float]] = []
+        for x, y in keypoints:
+            # Translate to origin at center
+            dx = x - 0.5
+            dy = y - 0.5
+            # Apply rotation
+            nx = cos_a * dx - sin_a * dy + 0.5
+            ny = sin_a * dx + cos_a * dy + 0.5
+            # Clamp to valid range
+            rotated_kps.append([max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))])
+
+        return img, rotated_kps
+
+
 def get_train_transforms(image_size: int, is_train: bool = True) -> Compose:
     """Gets the transformation pipeline.
-    
-    Note: For a fully featured pipeline with heavy geometric distorts (rotation, scale, skew)
-    you would dynamically track keypoint coordinates here. To maintain single baseline stability,
-    coordinate spaces are mapped to static [0,1] normalization post-crop.
-    
+
     Args:
         image_size (int): Target square dimension.
         is_train (bool, optional): Whether this is for training (enables augmentations). Defaults to True.
-        
+
     Returns:
         Compose: The composition of transforms.
     """
-    # Standard geometric augmentations drop-in point
-    # Integration of robust spatial libraries like Albumentations should route through here.
-    transforms = [
-        ResizeImage(image_size),
-        ToTensor(),
-        Normalize()
-    ]
+    transforms = [ResizeImage(image_size)]
+
+    if is_train:
+        transforms.append(RandomRotation(max_angle=15.0))
+
+    transforms.extend([ToTensor(), Normalize()])
     return Compose(transforms)
 
 def denormalize_image(tensor: torch.Tensor) -> torch.Tensor:

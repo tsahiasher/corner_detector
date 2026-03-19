@@ -1,16 +1,12 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+import torch.nn.functional as F
+from typing import Tuple, Optional, Dict
+import math
+
 
 class ConvBNReLU(nn.Module):
-    """Convolution followed by Batch Normalization and ReLU6.
-    
-    Args:
-        in_planes (int): Number of input channels.
-        out_planes (int): Number of output channels.
-        stride (int, optional): Convolution stride. Defaults to 1.
-        groups (int, optional): Number of blocked connections. Defaults to 1.
-    """
+    """Standard Convolution + BatchNorm + ReLU6 block."""
     def __init__(self, in_planes: int, out_planes: int, stride: int = 1, groups: int = 1) -> None:
         super().__init__()
         self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, groups=groups, bias=False)
@@ -18,24 +14,11 @@ class ConvBNReLU(nn.Module):
         self.relu = nn.ReLU6(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-        
-        Args:
-            x (torch.Tensor): Input tensor.
-            
-        Returns:
-            torch.Tensor: Output tensor.
-        """
         return self.relu(self.bn(self.conv(x)))
 
+
 class DepthwiseSeparableConv(nn.Module):
-    """Depthwise separable convolution block.
-    
-    Args:
-        in_planes (int): Number of input channels.
-        out_planes (int): Number of output channels.
-        stride (int, optional): Convolution stride. Defaults to 1.
-    """
+    """Depthwise Separable Convolution block."""
     def __init__(self, in_planes: int, out_planes: int, stride: int = 1) -> None:
         super().__init__()
         self.dw = ConvBNReLU(in_planes, in_planes, stride=stride, groups=in_planes)
@@ -44,151 +27,137 @@ class DepthwiseSeparableConv(nn.Module):
         self.relu = nn.ReLU6(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-        
-        Args:
-            x (torch.Tensor): Input tensor.
-            
-        Returns:
-            torch.Tensor: Output tensor.
-        """
         return self.relu(self.bn(self.pw(self.dw(x))))
 
-class SpatialSoftArgmax2D(nn.Module):
-    """Differentiable spatial to numerical transform (DSNT) with optional offset aggregation.
-    
-    Extracts continuous [0, 1] coordinates from 2D heatmaps.
-    """
-    def __init__(self, temperature: float = 1.0) -> None:
-        super().__init__()
-        self.temperature = temperature
-        
-    def forward(self, heatmaps: torch.Tensor, offset_maps: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            heatmaps (torch.Tensor): Unnormalized heatmaps of shape [B, C, H, W].
-            offset_maps (torch.Tensor, optional): Spatial offset fields [B, C * 2, H, W] for X and Y shifts.
-            
-        Returns:
-            torch.Tensor: Decoded [B, C, 2] normalized coordinates in range [0, 1].
-        """
-        B, C, H, W = heatmaps.size()
-        
-        # Flatten spatial dimensions
-        heatmaps_flat = heatmaps.view(B, C, H * W)
-        
-        # Apply softmax over spatial dimension to get probability distributions
-        weights = torch.nn.functional.softmax(heatmaps_flat / self.temperature, dim=-1) # [B, C, H*W]
-        
-        # Create normalized coordinate grid (trace-safe implementation)
-        range_y = torch.arange(H, device=heatmaps.device, dtype=heatmaps.dtype)
-        range_x = torch.arange(W, device=heatmaps.device, dtype=heatmaps.dtype)
-        
-        grid_y = range_y.view(H, 1).expand(H, W)
-        grid_x = range_x.view(1, W).expand(H, W)
-        
-        # Normalize grid to [0, 1] relative to center of bins
-        grid_x = (grid_x + 0.5) / W
-        grid_y = (grid_y + 0.5) / H
-        
-        grid_x_flat = grid_x.contiguous().view(1, 1, H * W)
-        grid_y_flat = grid_y.contiguous().view(1, 1, H * W)
-        
-        # Compute expected coordinates via soft-argmax
-        expected_x = torch.sum(weights * grid_x_flat, dim=-1) # [B, C]
-        expected_y = torch.sum(weights * grid_y_flat, dim=-1) # [B, C]
-        
-        coarse_coords = torch.stack([expected_x, expected_y], dim=-1) # [B, C, 2]
-        
-        # Aggregate sub-pixel offsets if provided
-        if offset_maps is not None:
-            # Reshape offsets to [B, C, 2, H*W]
-            offsets_flat = offset_maps.view(B, C, 2, H * W)
-            # Soft-sum offsets
-            expected_offsets = torch.sum(weights.unsqueeze(2) * offsets_flat, dim=-1) # [B, C, 2]
-            refined_coords = coarse_coords + expected_offsets
-            return refined_coords
-            
-        return coarse_coords
 
 class CoarseQuadNet(nn.Module):
-    """Coarse Quadrilateral Network for ID Card Corner Detection.
-    
-    Improved stage-1 model featuring a fully convolutional feature extractor and 
-    a hybrid DSNT (soft-argmax) spatial prediction head. Instead of collapsing 
-    to a single global vector early, it produces low-resolution per-corner heatmaps 
-    and associated offset maps, preserving spatial layout and geometric robustness.
-    
-    Predicts 4 ordered coarse corners (top-left, top-right, bottom-right, bottom-left)
-    normalized to [0, 1]. Total params: ~0.8M. Target deploy bounds suitable for CPU.
+    """Refined Coarse Quadrilateral Network for ID Card Detection.
+
+    Stage 1 Structured Design (v6.2 - Performance Boost v2):
+    1.  **High-Res Geometry Neck**: Fuses multi-scale features (1/4 to 1/32) 
+        for ultra-precise geographic anchoring at 96x96 resolution.
+    2.  **Dense Geometric Path**: Predicts Card Mask and Gaussian Boundary Contours.
+    3.  **Structured Parameterization**: Regresses Center, Size, Rotation, and 4 residuals.
+    4.  **Geometry-to-Corner Reconstruction**: Builds a rotated rectangle refined by residuals.
     """
     def __init__(self) -> None:
         super().__init__()
-        
-        # Backbone input shape: [B, 3, 384, 384]
-        self.stem = ConvBNReLU(3, 16, stride=2)                     # -> 192x192x16
-        
-        # Lightweight MobileNet-style downsampling
-        self.blocks = nn.Sequential(
-            DepthwiseSeparableConv(16, 32, stride=2),               # -> 96x96x32
-            DepthwiseSeparableConv(32, 64, stride=2),               # -> 48x48x64
-            DepthwiseSeparableConv(64, 64, stride=1),               # -> 48x48x64
-            DepthwiseSeparableConv(64, 128, stride=2),              # -> 24x24x128
-            DepthwiseSeparableConv(128, 128, stride=1),             # -> 24x24x128
-            DepthwiseSeparableConv(128, 256, stride=2),             # -> 12x12x256
-            DepthwiseSeparableConv(256, 256, stride=1),             # -> 12x12x256
-            DepthwiseSeparableConv(256, 512, stride=1),             # -> 12x12x512
-            DepthwiseSeparableConv(512, 512, stride=1),             # -> 12x12x512
-        )
-        
-        # Spatial Prediction Head
-        # Heatmap branch: 4 channels (one per corner)
-        self.heatmap_head = nn.Sequential(
-            DepthwiseSeparableConv(512, 256, stride=1),
-            nn.Conv2d(256, 4, kernel_size=1, stride=1)
-        )
-        
-        # Offset branch: 8 channels (dx, dy for each of the 4 corners)
-        self.offset_head = nn.Sequential(
-            DepthwiseSeparableConv(512, 256, stride=1),
-            nn.Conv2d(256, 8, kernel_size=1, stride=1)
-        )
-        
-        # Optional global score head
-        self.score_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.score_head = nn.Linear(512, 1)
-        
-        # Soft-argmax coordinate decoder
-        self.decoder = SpatialSoftArgmax2D(temperature=1.0)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
+        # Backbone: Input 384x384 -> 12x12
+        self.stem = ConvBNReLU(3, 16, stride=2)                       # 192
         
-        Args:
-            x (torch.Tensor): Input image tensor [B, 3, 384, 384].
-            
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - score: Global confidence score [B, 1] mapped to [0,1].
-                - corners: Normalized coordinate tensor [B, 4, 2] constrained to [0,1],
-                  incorporating robust proxy heatmap distributions with spatial offset shifts.
-        """
-        x = self.stem(x)
-        features = self.blocks(x)                                   # [B, 512, 12, 12]
+        # Split stage1 to get 96x96 features
+        self.stage1_feat = DepthwiseSeparableConv(16, 32, stride=2)    # 96
         
-        # Predict robust spatial probabilities and geometric refinements
-        heatmaps = self.heatmap_head(features)                      # [B, 4, 12, 12]
-        offsets = self.offset_head(features)                        # [B, 8, 12, 12]
+        self.stage1_down = nn.Sequential(
+            DepthwiseSeparableConv(32, 64, stride=2),                  # 48
+            DepthwiseSeparableConv(64, 64, stride=1),                  # 48
+        )
         
-        # Diff-friendly decode of exact coordinates
-        corners = self.decoder(heatmaps, offsets)                   # [B, 4, 2]
+        self.stage2 = nn.Sequential(
+            DepthwiseSeparableConv(64, 128, stride=2),                 # 24
+            DepthwiseSeparableConv(128, 128, stride=1),                # 24
+        )
         
-        # Clamp bounds strictly within typical image dimensions to maintain [0, 1] scale stability
-        corners = torch.clamp(corners, 0.0, 1.0)
+        self.stage3 = nn.Sequential(
+            DepthwiseSeparableConv(128, 256, stride=2),                # 12
+            DepthwiseSeparableConv(256, 256, stride=1),                # 12
+            DepthwiseSeparableConv(256, 512, stride=1),                # 12
+        )
+
+        # FPN Neck for 96x96 Geometric Path
+        self.lat_96 = nn.Conv2d(32, 64, kernel_size=1)
+        self.lat_48 = nn.Conv2d(64, 64, kernel_size=1)
+        self.lat_24 = nn.Conv2d(128, 64, kernel_size=1)
+        self.lat_12 = nn.Conv2d(512, 64, kernel_size=1)
         
-        # Predict overall object existence score
-        pooled = self.score_pool(features)                          # [B, 512, 1, 1]
-        pooled = torch.flatten(pooled, 1)
-        score = torch.sigmoid(self.score_head(pooled))              # [B, 1]
+        # Dense Refinement Head (96x96)
+        self.dense_refine = nn.Sequential(
+            DepthwiseSeparableConv(64, 64, stride=1),                 # 96
+            DepthwiseSeparableConv(64, 64, stride=1),                 # 96
+        )
+        self.geom_head = nn.Conv2d(64, 2, kernel_size=1)             # [Mask, Contour]
+
+        # Structured Quadrilateral Head
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))               # [512, 1, 1]
+        self.local_pool = nn.AdaptiveAvgPool2d((4, 4))                # [64, 4, 4]
         
-        return score, corners
+        self.quad_mlp = nn.Sequential(
+            nn.Linear(512 + 64*4*4, 256),
+            nn.ReLU6(inplace=True),
+            nn.Linear(256, 128),
+            nn.ReLU6(inplace=True),
+            nn.Linear(128, 14)
+        )
+        
+        self.register_buffer('base_rect', torch.tensor([
+            [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]
+        ], dtype=torch.float32).unsqueeze(0))
+
+        self.score_head = nn.Linear(512, 1)
+
+    def _reconstruct_corners(self, p: torch.Tensor) -> torch.Tensor:
+        """Reconstructs 4 keypoints from structured rotated-rectangle parameterization."""
+        B = p.size(0)
+        
+        cx, cy = torch.sigmoid(p[:, 0:1]), torch.sigmoid(p[:, 1:2])
+        w, h = torch.sigmoid(p[:, 2:3]), torch.sigmoid(p[:, 3:4])
+        
+        sin_phi, cos_phi = p[:, 4:5], p[:, 5:6]
+        norm = torch.sqrt(sin_phi**2 + cos_phi**2 + 1e-8)
+        s, c = sin_phi / norm, cos_phi / norm
+        
+        base = self.base_rect.expand(B, -1, -1)
+        bx, by = base[:, :, 0], base[:, :, 1]
+        
+        rx = (bx * w * c) - (by * h * s)
+        ry = (bx * w * s) + (by * h * c)
+        
+        corners = torch.stack([rx + cx, ry + cy], dim=-1)
+        
+        res = p[:, 6:14].view(B, 4, 2)
+        corners = corners + 0.1 * torch.tanh(res)
+        
+        return corners
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        B = x.size(0)
+        
+        # 1. Backbone
+        f_stem = self.stem(x)
+        f_96 = self.stage1_feat(f_stem)
+        f_48 = self.stage1_down(f_96)
+        f_24 = self.stage2(f_48)
+        f_12 = self.stage3(f_24)
+
+        # 2. Geometry Neck (FPN style)
+        p12 = self.lat_12(f_12)
+        p24 = self.lat_24(f_24) + F.interpolate(p12, size=(24, 24), mode='bilinear', align_corners=False)
+        p48 = self.lat_48(f_48) + F.interpolate(p24, size=(48, 48), mode='bilinear', align_corners=False)
+        # Upsample to 96x96 and fuse with lat_96
+        p96 = self.lat_96(f_96) + F.interpolate(p48, size=(96, 96), mode='bilinear', align_corners=False)
+        
+        dense_feat = self.dense_refine(p96)
+        geom_out = self.geom_head(dense_feat)
+        mask = torch.sigmoid(geom_out[:, 0:1])
+        edges = torch.sigmoid(geom_out[:, 1:2])
+
+        # 3. Structured Quadrilateral Path
+        f_global = self.global_pool(f_12).view(B, -1)
+        f_local = self.local_pool(dense_feat).view(B, -1)
+        q_feat = torch.cat([f_global, f_local], dim=1)
+        
+        params = self.quad_mlp(q_feat)
+        corners = self._reconstruct_corners(params)
+        res = params[:, 6:14].view(B, 4, 2)
+
+        # 4. Confidence Score
+        score = torch.sigmoid(self.score_head(f_global))
+
+        return {
+            'score': score,
+            'corners': corners,
+            'mask': mask,
+            'edges': edges,
+            'residuals': res
+        }
