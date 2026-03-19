@@ -18,6 +18,7 @@ from common.checkpoint import load_checkpoint
 from common.seed import set_seed
 from common.metrics import compute_patch_recall
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
+from common.visualization import save_indexed_visualization
 
 
 def setup_logging(log_file: str) -> logging.Logger:
@@ -63,48 +64,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_comparative_visualization(image_tensor: torch.Tensor, pred_norm: list, target_norm: list, img_path: str, out_dir: str) -> None:
-    """Draws predicted (orange) and target (green) corners onto the image and saves it.
-
-    Args:
-        image_tensor (torch.Tensor): Image tensor from the dataloader.
-        pred_norm (list): Predicted normalized corner coordinates.
-        target_norm (list): Ground truth normalized corner coordinates.
-        img_path (str): Original file path used for naming.
-        out_dir (str): Destination directory.
-    """
-    try:
-        import cv2
-        import numpy as np
-        from common.transforms import denormalize_image
-    except ImportError as e:
-        logging.getLogger('eval_pipeline').warning(f"Skipping visualization, missing dep: {e}")
-        return
-
-    img = denormalize_image(image_tensor.cpu()).permute(1, 2, 0).numpy()
-    img = np.clip(img, 0, 1)
-    img = (img * 255).astype(np.uint8)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-    h, w, _ = img.shape
-    pred_px = (np.array(pred_norm) * [w, h]).astype(np.int32)
-    target_px = (np.array(target_norm) * [w, h]).astype(np.int32)
-
-    def draw_poly(img_ref: "np.ndarray", pts: "np.ndarray", color: tuple, thickness: int) -> None:
-        for i in range(4):
-            cv2.circle(img_ref, tuple(pts[i]), 5, color, -1)
-            next_i = (i + 1) % 4
-            cv2.line(img_ref, tuple(pts[i]), tuple(pts[next_i]), color, thickness)
-
-    draw_poly(img, target_px, (0, 255, 0), 2)
-    draw_poly(img, pred_px, (0, 165, 255), 2)
-
-    cv2.putText(img, "Target (Green)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(img, "Predict (Orange)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-
-    name = os.path.basename(img_path)
-    out_path = os.path.join(out_dir, f"vis_{name}")
-    cv2.imwrite(out_path, img)
 
 
 def save_patch_diagnostic(image_tensor: torch.Tensor, pred_norm: list, target_norm: list,
@@ -242,12 +201,8 @@ def main() -> None:
             target_corners = batch['corners']
             paths = batch['img_path']
 
-            orig_size = batch.get('orig_size')
-            if isinstance(orig_size, (list, tuple)) and len(orig_size) == 2:
-                w_list, h_list = orig_size
-            else:
-                w_list = [384] * images.size(0)
-                h_list = [384] * images.size(0)
+            w_list = batch.get('orig_width', torch.full((images.size(0),), 384.0, device=device))
+            h_list = batch.get('orig_height', torch.full((images.size(0),), 384.0, device=device))
 
             t_infer = sync_time()
             score, pred_corners = model(images)
@@ -258,8 +213,8 @@ def main() -> None:
 
             for b_idx in range(images.size(0)):
                 try:
-                    w = float(w_list[b_idx])
-                    h = float(h_list[b_idx])
+                    w = w_list[b_idx].item()
+                    h = h_list[b_idx].item()
                 except Exception:
                     w, h = 384.0, 384.0
 
@@ -375,7 +330,15 @@ def main() -> None:
         for res in results_sorted:
             if drawn >= args.max_vis:
                 break
-            save_comparative_visualization(res['img_tensor'], res['p_norm'], res['t_norm'], res['img_path'], vis_dir)
+            pred_t = torch.tensor(res['p_norm'], dtype=torch.float32)
+            tgt_t = torch.tensor(res['t_norm'], dtype=torch.float32)
+            name = os.path.splitext(os.path.basename(res['img_path']))[0]
+            save_path = os.path.join(vis_dir, f"vis_{name}.jpg")
+            save_indexed_visualization(
+                res['img_tensor'], pred_t, tgt_t,
+                res['w'], res['h'], save_path,
+                img_path=res['img_path']
+            )
             drawn += 1
 
     # Patch diagnostic visualizations

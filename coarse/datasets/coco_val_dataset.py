@@ -72,19 +72,12 @@ class COCOValDataset(Dataset):
             y = kps[i*3 + 1] / h
             keypoints.append([x, y])
             
-        import math
-        cx = sum([pt[0] for pt in keypoints]) / 4.0
-        cy = sum([pt[1] for pt in keypoints]) / 4.0
-        def angle_from_center(pt: List[float]) -> float:
-            return math.atan2(pt[1] - cy, pt[0] - cx)
-            
-        keypoints = sorted(keypoints, key=angle_from_center)
-            
         image_t, keypoints_t = self.transforms(image, keypoints)
         
         return {
             'image': image_t,
             'corners': torch.tensor(keypoints_t, dtype=torch.float32),
             'img_path': img_path,
-            'orig_size': (w, h)
+            'orig_width': torch.tensor(float(w), dtype=torch.float32),
+            'orig_height': torch.tensor(float(h), dtype=torch.float32)
         }

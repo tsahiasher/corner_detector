@@ -70,6 +70,7 @@ class YOLOKeypointDataset(Dataset):
         img_path = self.image_paths[idx]
         try:
             image = Image.open(img_path).convert("RGB")
+            orig_w, orig_h = image.size
         except (UnidentifiedImageError, OSError) as e:
             logger.error(f"Dataset access read stream error at {img_path}: {e}")
             raise e
@@ -96,5 +97,7 @@ class YOLOKeypointDataset(Dataset):
         return {
             'image': image_t,
             'corners': torch.tensor(keypoints_t, dtype=torch.float32),
-            'img_path': img_path
+            'img_path': img_path,
+            'orig_width': torch.tensor(float(orig_w)),
+            'orig_height': torch.tensor(float(orig_h))
         }

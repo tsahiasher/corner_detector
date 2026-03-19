@@ -18,6 +18,7 @@ from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
 from common.metrics import compute_pixel_error, calculate_accuracy_metrics, compute_patch_recall, WingLoss, QuadShapeLoss
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
+from common.visualization import save_indexed_visualization
 
 
 def setup_logging(log_file: str) -> logging.Logger:
@@ -140,12 +141,14 @@ def main() -> None:
             batch = move_batch_to_device(batch, device)
             images = batch['image']
             target_corners = batch['corners']
+            w_list = batch.get('orig_width', torch.full((images.size(0),), 384.0, device=device))
+            h_list = batch.get('orig_height', torch.full((images.size(0),), 384.0, device=device))
 
             optimizer.zero_grad()
             pred_score, pred_corners = model(images)
 
-            # Wing loss for corner coordinates
-            wing_loss = corner_criterion(pred_corners, target_corners)
+            # Wing loss for corner coordinates with independent X/Y scaling
+            wing_loss = corner_criterion(pred_corners, target_corners, width=w_list, height=h_list)
 
             # Geometry-aware shape regularization
             shape_loss = shape_criterion(pred_corners)
@@ -175,6 +178,8 @@ def main() -> None:
         val_loss = 0.0
         all_errors = []
         all_patch_recalls = {64: [], 80: [], 96: []}
+        # Collect per-image data for top-k visualization
+        per_image_records = []  # list of (mean_error, image, pred, target, w, h, path)
 
         val_pbar = tqdm(val_loader, desc=f"Val Epoch {epoch+1}", leave=False)
         with torch.no_grad():
@@ -182,11 +187,13 @@ def main() -> None:
                 batch = move_batch_to_device(batch, device)
                 images = batch['image']
                 target_corners = batch['corners']
-                w_list, h_list = batch.get('orig_size', ([384]*images.size(0), [384]*images.size(0)))
+                w_list = batch.get('orig_width', torch.full((images.size(0),), 384.0, device=device))
+                h_list = batch.get('orig_height', torch.full((images.size(0),), 384.0, device=device))
+                img_paths = batch.get('img_path', [''] * images.size(0))
 
                 pred_score, pred_corners = model(images)
 
-                wing_loss = corner_criterion(pred_corners, target_corners)
+                wing_loss = corner_criterion(pred_corners, target_corners, width=w_list, height=h_list)
                 shape_loss = shape_criterion(pred_corners)
                 score_target = torch.ones_like(pred_score)
                 loss = wing_loss + args.shape_loss_weight * shape_loss + bce_criterion(pred_score, score_target)
@@ -202,6 +209,17 @@ def main() -> None:
                         target_corners[b_idx].unsqueeze(0), w, h
                     )
                     all_errors.append(err)
+                    mean_err = err.mean().item()
+
+                    # Store record for visualization (keep on CPU)
+                    per_image_records.append((
+                        mean_err,
+                        images[b_idx].cpu(),
+                        pred_corners[b_idx].cpu(),
+                        target_corners[b_idx].cpu(),
+                        w, h,
+                        img_paths[b_idx] if isinstance(img_paths, list) else img_paths[b_idx]
+                    ))
 
                     pr = compute_patch_recall(
                         pred_corners[b_idx].unsqueeze(0),
@@ -210,6 +228,15 @@ def main() -> None:
                     )
                     for ps in (64, 80, 96):
                         all_patch_recalls[ps].append(pr[f'patch_recall_{ps}px'])
+
+        # Save top-5 highest-loss visualizations
+        per_image_records.sort(key=lambda r: r[0], reverse=True)
+        vis_dir = os.path.join(run_dir, 'visualizations', f'epoch_{epoch+1}')
+        for rank, (m_err, img_t, pred_c, tgt_c, ow, oh, ipath) in enumerate(per_image_records[:5]):
+            base = os.path.splitext(os.path.basename(ipath))[0] if ipath else f'image_{rank}'
+            save_path = os.path.join(vis_dir, f'rank{rank+1}_{base}.jpg')
+            save_indexed_visualization(img_t, pred_c, tgt_c, ow, oh, save_path, img_path=ipath)
+        logger.info(f"Saved top-5 loss visualizations to {vis_dir}")
 
         val_time = sync_time() - epoch_start_time - train_time
         val_loss /= len(val_loader.dataset)

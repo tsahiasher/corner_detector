@@ -1,7 +1,7 @@
 import math
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Union
 
 
 def compute_pixel_error(pred_corners: torch.Tensor, target_corners: torch.Tensor, width: float, height: float) -> torch.Tensor:
@@ -122,20 +122,36 @@ class WingLoss(nn.Module):
         self.epsilon = epsilon
         self.C = self.w - self.w * math.log(1.0 + self.w / self.epsilon)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                width: Union[float, torch.Tensor] = 384.0,
+                height: Union[float, torch.Tensor] = 384.0) -> torch.Tensor:
         """Compute Wing Loss.
 
         Args:
             pred (torch.Tensor): Predicted coordinates [B, 4, 2].
             target (torch.Tensor): Target coordinates [B, 4, 2].
+            width (Union[float, torch.Tensor]): Scale factor(s) for X. Shape [B] or float.
+            height (Union[float, torch.Tensor]): Scale factor(s) for Y. Shape [B] or float.
 
         Returns:
             torch.Tensor: Scalar loss value.
         """
+        B = pred.size(0)
         diff = torch.abs(pred - target)
-        # Scale normalized [0,1] coords to a pixel-like range for meaningful w threshold
-        # With 384 input, multiply by 384 so w=10 means ~10px
-        diff_scaled = diff * 384.0
+        
+        # Resolve scaling into [B, 1, 2] for broadcasting
+        if isinstance(width, torch.Tensor):
+            w_t = width.view(B, 1, 1)
+        else:
+            w_t = torch.full((B, 1, 1), float(width), device=pred.device)
+            
+        if isinstance(height, torch.Tensor):
+            h_t = height.view(B, 1, 1)
+        else:
+            h_t = torch.full((B, 1, 1), float(height), device=pred.device)
+            
+        scale = torch.cat([w_t, h_t], dim=-1) # [B, 1, 2]
+        diff_scaled = diff * scale
 
         small = diff_scaled < self.w
         loss_small = self.w * torch.log(1.0 + diff_scaled / self.epsilon)
@@ -146,15 +162,14 @@ class WingLoss(nn.Module):
 
 
 class QuadShapeLoss(nn.Module):
-    """Geometry-aware quadrilateral shape regularizer.
+    """Geometry-aware quadrilateral shape regularizer (rotation-invariant).
 
     Encourages the predicted quadrilateral to maintain plausible rectangular geometry
     by penalizing:
-    1. Diagonal length asymmetry (both diagonals of a rectangle should be equal)
-    2. Non-convexity via cross-product sign consistency
-
-    This prevents the model from predicting collapsed, crossed, or wildly
-    non-rectangular quads that would break the downstream homography rectification.
+    1. Diagonal length asymmetry — finds the two longest internal segments
+       geometrically rather than assuming fixed index-based diagonals, so it
+       works correctly even when the card is rotated in the image.
+    2. Non-convexity via cross-product sign consistency for CW winding.
 
     Args:
         weight_diag (float): Weight for diagonal symmetry term. Defaults to 1.0.
@@ -169,23 +184,36 @@ class QuadShapeLoss(nn.Module):
         """Compute shape regularization loss.
 
         Args:
-            corners (torch.Tensor): Predicted corners [B, 4, 2] in order TL, TR, BR, BL.
+            corners (torch.Tensor): Predicted corners [B, 4, 2] as semantic
+                keypoints (index 0 = card's physical TL, etc.).  The order
+                is preserved regardless of image rotation.
 
         Returns:
             torch.Tensor: Scalar shape loss.
         """
-        tl = corners[:, 0, :]  # [B, 2]
-        tr = corners[:, 1, :]
-        br = corners[:, 2, :]
-        bl = corners[:, 3, :]
+        # --- Diagonal symmetry (rotation-invariant) ---
+        # Compute all 6 pairwise distances among the 4 corners.
+        # For a convex quadrilateral the two longest segments are the diagonals.
+        pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        dists = []
+        for i, j in pairs:
+            d = torch.norm(corners[:, i, :] - corners[:, j, :], dim=-1)  # [B]
+            dists.append(d)
+        dist_stack = torch.stack(dists, dim=-1)  # [B, 6]
 
-        # Diagonal symmetry: |diag1| should be close to |diag2|
-        diag1 = torch.norm(br - tl, dim=-1)  # [B]
-        diag2 = torch.norm(bl - tr, dim=-1)  # [B]
-        diag_loss = torch.abs(diag1 - diag2).mean()
+        # Select the two longest as diagonals
+        top2, _ = dist_stack.topk(2, dim=-1)  # [B, 2]
+        diag_loss = torch.abs(top2[:, 0] - top2[:, 1]).mean()
 
-        # Convexity: all cross products of consecutive edges should have the same sign
-        edges = [tr - tl, br - tr, bl - br, tl - bl]  # 4 edge vectors
+        # --- Convexity (already rotation-invariant) ---
+        # Consecutive edges in index order; cross-product sign must be
+        # consistently positive for CW winding in image space (Y-down).
+        edges = [
+            corners[:, 1, :] - corners[:, 0, :],
+            corners[:, 2, :] - corners[:, 1, :],
+            corners[:, 3, :] - corners[:, 2, :],
+            corners[:, 0, :] - corners[:, 3, :],
+        ]
         cross_products = []
         for i in range(4):
             e1 = edges[i]
@@ -194,7 +222,7 @@ class QuadShapeLoss(nn.Module):
             cross_products.append(cross)
 
         cross_stack = torch.stack(cross_products, dim=-1)  # [B, 4]
-        # Penalize if any cross product is negative (should all be positive for CCW order)
+        # Penalize negative cross products to enforce CW winding.
         convex_loss = torch.relu(-cross_stack).mean()
 
         return self.weight_diag * diag_loss + self.weight_convex * convex_loss

@@ -16,6 +16,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
+from common.visualization import draw_indexed_corners
 
 def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     """Configures explicit, clean logging for deterministic inference."""
@@ -66,25 +67,49 @@ def preprocess_image(image: Image.Image, target_size: int, device: torch.device)
     tensor = TF.normalize(tensor, mean=mean, std=std)
     return tensor.unsqueeze(0).to(device)
 
-def save_visualization(image: Image.Image, corners_px: List[List[int]], img_path: str, output_dir: str) -> None:
+def save_visualization(image: Image.Image, corners_norm: list, corners_px: List[List[int]],
+                       img_path: str, output_dir: str, input_size: int) -> None:
+    """Draws indexed predicted corners on the original-scale image and saves it.
+
+    Args:
+        image (Image.Image): Original PIL image.
+        corners_norm (list): Normalized corner coordinates [[x,y], ...].
+        corners_px (List[List[int]]): Pixel-space corner coordinates.
+        img_path (str): Original image path.
+        output_dir (str): Destination directory.
+        input_size (int): Model input resolution used for preprocessing.
+    """
     try:
         import cv2
         import numpy as np
     except ImportError:
         logging.getLogger('inference_pipeline').warning("Skipping visualization because OpenCV (cv2) or NumPy is not installed.")
         return
-        
+
+    orig_w, orig_h = image.size
     img_np = np.array(image)
     if len(img_np.shape) == 3 and img_np.shape[2] == 3:
         img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     elif len(img_np.shape) == 2:
         img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
-        
+
+    h, w = img_np.shape[:2]
+    label_names = ['TL', 'TR', 'BR', 'BL']
+    color_pred = (0, 165, 255)  # Orange
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.5, min(w, h) / 800.0)
+    thickness = max(1, int(min(w, h) / 400))
+    radius = max(4, int(min(w, h) / 150))
+
+    # Draw polygon and indexed labels
     for i in range(4):
-        cv2.circle(img_np, tuple(corners_px[i]), 5, (0, 165, 255), -1)
-        next_i = (i + 1) % 4
-        cv2.line(img_np, tuple(corners_px[i]), tuple(corners_px[next_i]), (0, 255, 0), 2)
-        
+        pt = tuple(corners_px[i])
+        next_pt = tuple(corners_px[(i + 1) % 4])
+        cv2.line(img_np, pt, next_pt, (0, 255, 0), thickness)
+        cv2.circle(img_np, pt, radius, color_pred, -1)
+        label = f"{i}:{label_names[i]}"
+        cv2.putText(img_np, label, (pt[0] + 8, pt[1] - 8), font, font_scale, color_pred, thickness)
+
     base_name = os.path.basename(img_path)
     out_path = os.path.join(output_dir, f"infer_{base_name}")
     cv2.imwrite(out_path, img_np)
@@ -130,7 +155,7 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
 
     # Actions
     if not args.no_vis and args.save_vis:
-        save_visualization(image, corners_px, img_path, args.output_dir)
+        save_visualization(image, corners_norm, corners_px, img_path, args.output_dir, args.input_size)
         
     json_path = os.path.join(args.output_dir, f"result_{os.path.basename(img_path)}.json")
     if args.save_json:
