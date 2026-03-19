@@ -53,12 +53,12 @@ class CoarseQuadNet(nn.Module):
             DepthwiseSeparableConv(32, 64, stride=2),                  # 48
             DepthwiseSeparableConv(64, 64, stride=1),                  # 48
         )
-        
+
         self.stage2 = nn.Sequential(
             DepthwiseSeparableConv(64, 128, stride=2),                 # 24
             DepthwiseSeparableConv(128, 128, stride=1),                # 24
         )
-        
+
         self.stage3 = nn.Sequential(
             DepthwiseSeparableConv(128, 256, stride=2),                # 12
             DepthwiseSeparableConv(256, 256, stride=1),                # 12
@@ -81,7 +81,7 @@ class CoarseQuadNet(nn.Module):
         # Structured Quadrilateral Head
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))               # [512, 1, 1]
         self.local_pool = nn.AdaptiveAvgPool2d((4, 4))                # [64, 4, 4]
-        
+
         self.quad_mlp = nn.Sequential(
             nn.Linear(512 + 64*4*4, 256),
             nn.ReLU6(inplace=True),
@@ -99,7 +99,7 @@ class CoarseQuadNet(nn.Module):
     def _reconstruct_corners(self, p: torch.Tensor) -> torch.Tensor:
         """Reconstructs 4 keypoints from structured rotated-rectangle parameterization."""
         B = p.size(0)
-        
+
         cx, cy = torch.sigmoid(p[:, 0:1]), torch.sigmoid(p[:, 1:2])
         w, h = torch.sigmoid(p[:, 2:3]), torch.sigmoid(p[:, 3:4])
         
@@ -112,7 +112,7 @@ class CoarseQuadNet(nn.Module):
         
         rx = (bx * w * c) - (by * h * s)
         ry = (bx * w * s) + (by * h * c)
-        
+
         corners = torch.stack([rx + cx, ry + cy], dim=-1)
         
         res = p[:, 6:14].view(B, 4, 2)

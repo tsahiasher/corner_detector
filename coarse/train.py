@@ -102,12 +102,12 @@ def main() -> None:
     logger.info("Initializing datasets...")
     train_dataset = YOLOKeypointDataset(args.train_images, image_size=args.image_size)
     val_dataset = COCOValDataset(args.val_images, args.val_json, image_size=args.image_size)
-    
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
                               num_workers=args.num_workers, pin_memory=args.pin_memory)
-    
+
     miner = HardExampleMiner(len(train_dataset))
-    
+
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
                             num_workers=args.num_workers, pin_memory=args.pin_memory)
 
@@ -170,7 +170,7 @@ def main() -> None:
             
             # 1. Coordinate Accuracy (Ordered 4 Corners)
             loss_coord = coord_criterion(out['corners'], gt_corners)
-            
+
             # 2. Geometric Anchoring (Mask + Boundary)
             loss_mask = 0.5 * dice_criterion(out['mask'], batch['mask']) + 0.5 * bce_dense_criterion(out['mask'], batch['mask'])
             loss_edge = 0.5 * dice_criterion(out['edges'], batch['edges']) + 0.5 * bce_dense_criterion(out['edges'], batch['edges'])
@@ -178,7 +178,7 @@ def main() -> None:
             # 3. Shape & Parameter Regularization
             loss_shape = shape_criterion(out['corners'])
             loss_reg = torch.mean(out['residuals'] ** 2)
-            
+
             # 4. Alignment
             loss_align = align_criterion(out['corners'], out['edges'].detach(), out['mask'].detach())
             
@@ -218,7 +218,7 @@ def main() -> None:
         tracker.start_val_phase()
         all_errs = []
         top_tracker = TopLossTracker(k=5)
-        
+
         val_pbar = tqdm(val_loader, desc=f"Val Epoch {epoch+1}", leave=False)
         with torch.inference_mode():
             for batch in val_pbar:
@@ -256,7 +256,7 @@ def main() -> None:
                     })
 
         tracker.end_val_phase()
-        
+
         # Metrics
         errors = torch.cat(all_errs, dim=0)
         metrics = calculate_accuracy_metrics(errors)

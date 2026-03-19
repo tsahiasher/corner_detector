@@ -18,7 +18,7 @@ def compute_pixel_error(pred_corners: torch.Tensor, target_corners: torch.Tensor
 
 def compute_patch_recall(errors: Any, patch_sizes: Tuple[int, ...] = (64, 80, 96)) -> Dict[str, float]:
     """Computes patch recall percentage from distance errors.
-    
+
     Robust to both torch.Tensor and numpy.ndarray.
     """
     if isinstance(errors, torch.Tensor):

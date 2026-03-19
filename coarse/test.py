@@ -136,7 +136,7 @@ def main() -> None:
             
             # Use structured corners for precision metrics
             pred = out['corners']
-            
+
             # Compute pixel errors
             diff = (pred - gt_corners).abs()
             diff[:, :, 0] *= batch['orig_width'].view(-1, 1)
