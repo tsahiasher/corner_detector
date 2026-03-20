@@ -40,7 +40,12 @@ class HeatmapRefinerNet(nn.Module):
         )
         
         from common.metrics import SoftArgmax2D
-        self.soft_argmax = SoftArgmax2D(beta=100.0)
+        # beta=20.0 is much more stable than 100.0 for initial training
+        self.soft_argmax = SoftArgmax2D(beta=20.0)
+        
+        # Zero-initialize the last layer so the model starts with a flat heatmap (prediction at center 0.5, 0.5)
+        nn.init.zeros_(self.heatmap_head[-1].weight)
+        nn.init.zeros_(self.heatmap_head[-1].bias)
 
     def forward(self, x):
         """

@@ -113,18 +113,22 @@ def main() -> None:
 
     global_start_time = sync_time()
     for epoch in range(start_epoch, args.epochs):
+        logger.info("\n" + "="*80)
+        logger.info(f" EPOCH {epoch+1}/{args.epochs} ".center(80, "="))
+        logger.info("="*80)
+        
         tracker.start_epoch()
         current_lr = optimizer.param_groups[0]['lr']
 
         # === Training ===
         model.train()
         tracker.start_train_phase()
-        train_pbar = tqdm(train_loader, desc=f"Train Epoch {epoch+1}", leave=False)
+        train_pbar = tqdm(train_loader, desc=f"Train", leave=False)
         for batch in train_pbar:
             batch_start = sync_time()
             batch = move_batch_to_device(batch, device)
-            patches = batch['patches']   # [B, 4, 3, ps, ps]
-            targets = batch['targets']   # [B, 4, 2]
+            patches = batch['patches']
+            targets = batch['targets']
             B = patches.size(0)
             
             patches_flat = patches.view(B * 4, 3, args.patch_size, args.patch_size)
@@ -132,7 +136,7 @@ def main() -> None:
 
             optimizer.zero_grad()
             pred = model(patches_flat)
-            # Critical: Pass patch_size to align loss with pixels (backward-compatible args)
+            # Backward-compatible scaling (Stage 1/2)
             loss = corner_criterion(pred, targets_flat, width=args.patch_size, height=args.patch_size)
             loss.backward()
             optimizer.step()
@@ -141,11 +145,13 @@ def main() -> None:
             train_pbar.set_postfix({'loss': f"{loss.item():.5f}"})
         
         tracker.end_train_phase()
+        avg_train_loss = sum(tracker.train_losses) / len(tracker.train_losses)
 
         # === Multi-Mode Validation ===
         def validate(loader, name, is_top_tracker=False):
             model.eval()
             errors = []
+            losses = []
             top_tracker = TopLossTracker(k=5) if is_top_tracker else None
             
             val_pbar = tqdm(loader, desc=f"Val {name}", leave=False)
@@ -160,6 +166,8 @@ def main() -> None:
                     targets_flat = targets.view(B * 4, 2)
 
                     pred = model(patches_flat)
+                    val_loss = corner_criterion(pred, targets_flat, width=args.patch_size, height=args.patch_size)
+                    losses.append(val_loss.item())
                     
                     # Pixel error in patch coordinates
                     diff = (pred - targets_flat) * args.patch_size
@@ -177,19 +185,21 @@ def main() -> None:
             
             all_errors = torch.cat(errors, dim=0)
             metrics = calculate_accuracy_metrics(all_errors)
-            return metrics, top_tracker
+            avg_loss = sum(losses) / len(losses)
+            return metrics, avg_loss, top_tracker
 
-        metrics_clean, _ = validate(val_loader_clean, "Clean")
-        metrics_jitter, jitter_top = validate(val_loader_jittered, "Jittered", is_top_tracker=True)
+        metrics_clean, loss_clean, _ = validate(val_loader_clean, "Clean")
+        metrics_jitter, loss_jitter, jitter_top = validate(val_loader_jittered, "Jittered", is_top_tracker=True)
         
-        # Merge metrics for tracking (use jittered for the main tracker loss/etc)
-        # tracker.record_batch expects loss, but we'll manually summarize
-        tracker.val_metrics = metrics_jitter # Main tracking metrics
-        
-        # Logging
-        logger.info(f"Epoch {epoch+1}/{args.epochs} | LR: {current_lr:.6f}")
-        logger.info(f"  Clean Val:    MeanError={metrics_clean['mean']:.3f}px, <2px={metrics_clean['acc_2px']:.1f}%")
-        logger.info(f"  Jittered Val: MeanError={metrics_jitter['mean']:.3f}px, <2px={metrics_jitter['acc_2px']:.1f}%")
+        # Logging Summary Table
+        logger.info(f"LR: {current_lr:.6f}")
+        logger.info("-" * 65)
+        logger.info(f"{'Phase':<15} | {'Loss':<10} | {'Mean (px)':<10} | {'<2px (%)':<10}")
+        logger.info("-" * 65)
+        logger.info(f"{'Train':<15} | {avg_train_loss:<10.5f} | {'-':<10} | {'-':<10}")
+        logger.info(f"{'Clean Val':<15} | {loss_clean:<10.5f} | {metrics_clean['mean']:<10.3f} | {metrics_clean['acc_2px']:<10.1f}")
+        logger.info(f"{'Jittered Val':<15} | {loss_jitter:<10.5f} | {metrics_jitter['mean']:<10.3f} | {metrics_jitter['acc_2px']:<10.1f}")
+        logger.info("-" * 65)
         
         scheduler.step()
 

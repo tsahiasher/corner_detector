@@ -59,6 +59,9 @@ class RefineKeypointDataset(Dataset):
 
         # Use OpenCV for high-res cropping (faster than PIL for specific regions)
         img = cv2.imread(img_path)
+        if img is None:
+            # Fallback or error
+            return self.__getitem__((idx + 1) % len(self))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         H, W = img.shape[:2]
 

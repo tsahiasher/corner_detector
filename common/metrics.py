@@ -120,7 +120,7 @@ class SoftArgmax2D(nn.Module):
     Differentiable Soft-Argmax for sub-pixel heatmap localization.
     Maps a heatmap to [0, 1] coordinates.
     """
-    def __init__(self, beta: float = 100.0):
+    def __init__(self, beta: float = 10.0):
         super().__init__()
         self.beta = beta
 
