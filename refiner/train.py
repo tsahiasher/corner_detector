@@ -135,9 +135,14 @@ def main() -> None:
             targets_flat = targets.view(B * 4, 2)
 
             optimizer.zero_grad()
-            pred = model(patches_flat)
-            # Backward-compatible scaling (Stage 1/2)
-            loss = corner_criterion(pred, targets_flat, width=args.patch_size, height=args.patch_size)
+            # IterativeRefinerNet returns (final, coarse) in training mode
+            final_pred, coarse_pred = model(patches_flat)
+            
+            # Multi-level loss
+            loss_coarse = corner_criterion(coarse_pred, targets_flat, width=args.patch_size, height=args.patch_size)
+            loss_final = corner_criterion(final_pred, targets_flat, width=args.patch_size, height=args.patch_size)
+            loss = 0.5 * loss_coarse + 1.0 * loss_final
+            
             loss.backward()
             optimizer.step()
 
@@ -165,12 +170,13 @@ def main() -> None:
                     patches_flat = patches.view(B * 4, 3, args.patch_size, args.patch_size)
                     targets_flat = targets.view(B * 4, 2)
 
-                    pred = model(patches_flat)
-                    val_loss = corner_criterion(pred, targets_flat, width=args.patch_size, height=args.patch_size)
-                    losses.append(val_loss.item())
+                    # In eval mode, model now returns (final, coarse) for TS consistency
+                    final_pred, coarse_pred = model(patches_flat)
+                    v_loss = corner_criterion(final_pred, targets_flat, width=args.patch_size, height=args.patch_size)
+                    losses.append(v_loss.item())
                     
                     # Pixel error in patch coordinates
-                    diff = (pred - targets_flat) * args.patch_size
+                    diff = (final_pred - targets_flat) * args.patch_size
                     dist = torch.norm(diff, dim=-1) # [B*4]
                     errors.append(dist.cpu())
                     
@@ -178,7 +184,8 @@ def main() -> None:
                         for i in range(dist.size(0)):
                             top_tracker.update(dist[i].item(), {
                                 'image': patches_flat[i],
-                                'pred': pred[i:i+1],
+                                'pred': final_pred[i:i+1],
+                                'secondary': coarse_pred[i:i+1],
                                 'gt': targets_flat[i:i+1],
                                 'path': batch['img_path'][i // 4]
                             })
@@ -192,15 +199,23 @@ def main() -> None:
         metrics_jitter, loss_jitter, jitter_top = validate(val_loader_jittered, "Jittered", is_top_tracker=True)
         
         # Logging Summary Table
-        logger.info(f"LR: {current_lr:.6f}")
-        logger.info("-" * 65)
-        logger.info(f"{'Phase':<15} | {'Loss':<10} | {'Mean (px)':<10} | {'<2px (%)':<10}")
-        logger.info("-" * 65)
-        logger.info(f"{'Train':<15} | {avg_train_loss:<10.5f} | {'-':<10} | {'-':<10}")
-        logger.info(f"{'Clean Val':<15} | {loss_clean:<10.5f} | {metrics_clean['mean']:<10.3f} | {metrics_clean['acc_2px']:<10.1f}")
-        logger.info(f"{'Jittered Val':<15} | {loss_jitter:<10.5f} | {metrics_jitter['mean']:<10.3f} | {metrics_jitter['acc_2px']:<10.1f}")
-        logger.info("-" * 65)
+        logger.info(f"LR: {current_lr:.6f} | Jitter: {train_loader.dataset.jitter_px:.1f}px")
+        header = f"{'Phase':<15} | {'Loss':<10} | {'Mean (px)':<10} | {'<1px (%)':<10} | {'<2px (%)':<10} | {'<3px (%)':<10}"
+        logger.info("-" * len(header))
+        logger.info(header)
+        logger.info("-" * len(header))
+        logger.info(f"{'Train':<15} | {avg_train_loss:<10.5f} | {'-':<10} | {'-':<10} | {'-':<10} | {'-':<10}")
+        fmt = lambda m, l: f"{l:<10.5f} | {m['mean']:<10.3f} | {m['acc_1px']:<10.1f} | {m['acc_2px']:<10.1f} | {m['acc_3px']:<10.1f}"
+        logger.info(f"{'Clean Val':<15} | " + fmt(metrics_clean, loss_clean))
+        logger.info(f"{'Jittered Val':<15} | " + fmt(metrics_jitter, loss_jitter))
+        logger.info("-" * len(header))
         
+        # Jitter Curriculum: reduce jitter in last 10 epochs
+        if (epoch + 1) > (args.epochs - 10):
+            frac = (epoch + 1 - (args.epochs - 10)) / 10.0
+            # Target 5px jitter in final epoch
+            train_loader.dataset.jitter_px = max(5.0, args.jitter_px * (1.0 - frac * 0.66))
+
         scheduler.step()
 
         # Save Visualizations for Top Jittered Losses
@@ -210,9 +225,10 @@ def main() -> None:
                 save_diagnostic_visualization(
                     sample['image'], sample['pred'], sample['gt'],
                     None, None,
-                    sample['path'], epoch_vis_dir
+                    sample['path'], epoch_vis_dir,
+                    secondary_corners=sample.get('secondary')
                 )
-
+        
         # Checkpoints based on Jittered Mean Error
         latest_path = os.path.join(run_dir, 'checkpoints', 'last.pt')
         save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics_jitter['mean'], latest_path)

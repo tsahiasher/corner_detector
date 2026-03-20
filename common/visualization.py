@@ -186,7 +186,8 @@ def save_diagnostic_visualization(
     mask_tensor: Optional[torch.Tensor],
     edge_tensor: Optional[torch.Tensor],
     img_path: str,
-    output_dir: str
+    output_dir: str,
+    secondary_corners: Optional[torch.Tensor] = None
 ) -> None:
     """Saves a rich diagnostic image for multi-stage debugging."""
     try:
@@ -209,6 +210,13 @@ def save_diagnostic_visualization(
     pred_px = (pred_np * [w, h]).astype(np.int32)
     tgt_px = (tgt_np * [w, h]).astype(np.int32)
     
+    # Draw secondary (coarse) corners if provided
+    if secondary_corners is not None:
+        sec_np = secondary_corners.cpu().numpy() if isinstance(secondary_corners, torch.Tensor) else np.array(secondary_corners)
+        sec_px = (sec_np * [w, h]).astype(np.int32)
+        for px, py in sec_px:
+            cv2.circle(img, (int(px), int(py)), 3, (255, 0, 0), -1) # Blue Coarse
+
     # If exactly 4 corners, draw a closed quad
     if len(tgt_px) == 4:
         cv2.polylines(img, [tgt_px.reshape(-1, 1, 2)], True, (0, 255, 0), 2)  # Green GT

@@ -43,7 +43,7 @@ def compute_patch_recall(errors: Any, patch_sizes: Tuple[int, ...] = (64, 80, 96
     return results
 
 
-def calculate_accuracy_metrics(errors: Any, thresholds: Tuple[int, ...] = (2, 3, 5, 10)) -> Dict[str, float]:
+def calculate_accuracy_metrics(errors: Any, thresholds: Tuple[int, ...] = (1, 2, 3, 5, 10)) -> Dict[str, float]:
     """Calculates accuracy summary metrics. Robust to both torch.Tensor and numpy.ndarray."""
     if isinstance(errors, torch.Tensor):
         errors_np = errors.detach().cpu().numpy()
