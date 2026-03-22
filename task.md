@@ -37,9 +37,18 @@
 ## Scripts
 python coarse\train.py --epochs 50 --batch_size 480
 
-python coarse\test.py --weights coarse\runs\20260319_180637\checkpoints\best.pt
+python coarse\test.py --weights coarse\runs\20260321_194732\checkpoints\best.pt
 
-python coarse\export_torchscript.py --weights coarse\runs\20260319_180637\checkpoints\best.pt --output coarse\runs\20260319_180637\checkpoints\coarse_quad_net.pt
+python coarse\export_torchscript.py --weights coarse\runs\20260321_194732\checkpoints\best.pt --output coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt
 
-python coarse\run_torchscript_image.py --model coarse\runs\20260319_180637\checkpoints\coarse_quad_net.pt --image your_id_card.jpg
+python coarse\run_torchscript_image.py --model coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt --image your_id_card.jpg
 
+python refiner\train.py --epochs 50 --batch_size 480
+
+python refiner\test.py --weights refiner\runs\20260322_023415\checkpoints\best.pt
+
+python refiner\export_torchscript.py --weights refiner\runs\20260322_023415\checkpoints\best.pt --output refiner\runs\20260322_023415\checkpoints\patch_refiner.pt
+
+python refiner\run_torchscript_image.py --model refiner\runs\20260322_023415\checkpoints\patch_refiner.pt --image ..\test_images\001.jpg --coarse_results coarse\runs\20260321_194732\inference_outputs
+
+corner_detector>python run_torchscript_image.py --coarse_mode coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt --refiner_model refiner\runs\20260322_023415\checkpoints\patch_refiner.pt --input ..\test_images\001.jpg

@@ -17,6 +17,8 @@ import torchvision.transforms.functional as TF
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
 from common.visualization import save_diagnostic_visualization
+from common.checkpoint import load_checkpoint
+from refiner.models.patch_refiner import PatchRefinerNet
 
 def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger('refiner_inference')
@@ -39,11 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model', type=str, required=True, help="Path to Refiner TorchScript model (.pt).")
     parser.add_argument('--image', type=str, required=True, help="Path to image or directory.")
     parser.add_argument('--coarse_results', type=str, required=True, help="Path to Stage 1 JSON results directory.")
-    parser.add_argument('--output_dir', type=str, default='./refiner_outputs', help="Output directory.")
+    parser.add_argument('--output_dir', type=str, default='', help="Output directory.")
     parser.add_argument('--patch_size', type=int, default=96, help="Patch size used during training.")
     add_device_args(parser, default='cpu')
     parser.add_argument('--save_vis', action='store_true', default=True)
     parser.add_argument('--save_json', action='store_true', default=True)
+    parser.add_argument('--pytorch', action='store_true', help="Load PyTorch checkpoint (.pt) instead of TorchScript model.")
     return parser.parse_args()
 
 def extract_patch(img_np: np.ndarray, cx: float, cy: float, patch_size: int) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -87,9 +90,16 @@ def process_image(img_path: str, model: Any, coarse_data: Dict, args: argparse.N
         patch_t = preprocess_patch(patch_np, device)
         
         with torch.inference_mode():
-            pred = model(patch_t) # [1, 2] in [0, 1] range
-        
-        ox, oy = pred[0].cpu().tolist()
+            pred = model(patch_t)
+            
+        # Handle both (final, coarse) tuple and single tensor returns
+        if isinstance(pred, (list, tuple)):
+            pred_tensor = pred[0]
+        else:
+            pred_tensor = pred
+            
+        # pred_tensor is [1, 2], unpacking [0] gives (ox, oy)
+        ox, oy = pred_tensor[0].cpu().tolist()
         rx = x1 + ox * args.patch_size
         ry = y1 + oy * args.patch_size
         refined_corners_px.append([rx, ry])
@@ -111,7 +121,7 @@ def process_image(img_path: str, model: Any, coarse_data: Dict, args: argparse.N
         pts = np.array(refined_corners_px, np.int32).reshape((-1, 1, 2))
         cv2.polylines(vis_img, [pts], True, (0, 255, 0), 2)
         
-        out_path = os.path.join(args.output_dir, f"refined_{os.path.basename(img_path)}")
+        out_path = os.path.join(args.output_dir, os.path.basename(img_path))
         cv2.imwrite(out_path, vis_img)
 
     # JSON
@@ -122,7 +132,8 @@ def process_image(img_path: str, model: Any, coarse_data: Dict, args: argparse.N
             'refined_corners': refined_corners_px,
             'timing_ms': total_ms
         }
-        json_path = os.path.join(args.output_dir, f"refined_{os.path.basename(img_path)}.json")
+        json_name = os.path.splitext(os.path.basename(img_path))[0] + ".json"
+        json_path = os.path.join(args.output_dir, json_name)
         with open(json_path, 'w') as f:
             json.dump(result, f, indent=4)
             
@@ -134,12 +145,35 @@ def main():
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
     
+    if not args.output_dir:
+        input_p = os.path.abspath(args.image)
+        if os.path.isdir(input_p):
+            input_base = input_p.rstrip('\\/')
+        else:
+            input_base = os.path.dirname(input_p)
+        args.output_dir = input_base + "_cropped"
+        
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load model
-    logger.info(f"Loading Refiner Model: {args.model}")
-    model = torch.jit.load(args.model, map_location=device)
-    model.eval()
+    t0 = sync_time()
+    try:
+        if args.pytorch:
+            logger.info(f"Loading Refiner model (PyTorch): {args.model}")
+            model = PatchRefinerNet().to(device)
+            load_checkpoint(model, None, None, args.model, device=device)
+            model.eval()
+        else:
+            logger.info(f"Loading Refiner model (TorchScript): {args.model}")
+            model = torch.jit.load(args.model, map_location=device)
+            model.eval()
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        return
+    t_load_model = sync_time() - t0
+    
+    logger.info(f"Model Path:         {args.model}")
+    logger.info(f"Model Load Time:    {t_load_model*1000:.1f} ms\n")
     
     # Find images
     image_paths = []
@@ -152,9 +186,10 @@ def main():
     logger.info(f"Processing {len(image_paths)} images...")
     
     for img_p in image_paths:
-        # Expected Stage 1 JSON: result_[basename].json
+        # Expected Stage 1 JSON: {name_no_ext}.json
         base = os.path.basename(img_p)
-        coarse_json = os.path.join(args.coarse_results, f"result_{base}.json")
+        name_no_ext = os.path.splitext(base)[0]
+        coarse_json = os.path.join(args.coarse_results, f"{name_no_ext}.json")
         
         if not os.path.exists(coarse_json):
             logger.warning(f"Skipping {base}: Missing coarse result {coarse_json}")

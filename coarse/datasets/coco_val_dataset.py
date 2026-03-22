@@ -73,7 +73,7 @@ class COCOValDataset(Dataset):
             keypoints.append([x, y])
             
         image_t, keypoints_t = self.transforms(image, keypoints)
-        
+
         # Generate dense geometric targets (96x96 for v2 boost)
         mask_t, edges_t = self.generate_mask_and_edges(keypoints_t, size=96)
         

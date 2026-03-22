@@ -162,7 +162,7 @@ def main() -> None:
             targets_flat = targets.view(B * 4, 2)
 
             t_infer = sync_time()
-            pred = model(patches_flat)  # [B*4, 2]
+            pred, _ = model(patches_flat)  # [B*4, 2], [B*4, 2]
             infer_time = sync_time() - t_infer
 
             total_infer_time += infer_time

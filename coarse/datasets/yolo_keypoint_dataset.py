@@ -128,7 +128,7 @@ class YOLOKeypointDataset(Dataset):
             raise ValueError(f"Missing or malformed YOLO annotation for image: {img_path}.")
             
         image_t, keypoints_t = self.transforms(image, keypoints)
-        
+
         # Generate dense geometric targets (96x96 for v2 boost)
         mask_t, edges_t = self.generate_mask_and_edges(keypoints_t, size=96)
         

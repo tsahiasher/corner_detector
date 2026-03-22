@@ -17,6 +17,8 @@ from PIL import Image
 
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
 from common.visualization import draw_indexed_corners, save_diagnostic_visualization
+from common.checkpoint import load_checkpoint
+from coarse.models.coarse_quad_net import CoarseQuadNet
 
 def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     """Configures explicit, clean logging for deterministic inference."""
@@ -45,13 +47,14 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument('--model', type=str, required=True, help="Path to the exported TorchScript model (.pt).")
     parser.add_argument('--image', type=str, required=True, help="Path to the input image or directory of images.")
-    parser.add_argument('--output_dir', type=str, default='./inference_outputs', help="Directory to save execution artifacts (visualizations, JSON).")
+    parser.add_argument('--output_dir', type=str, default='', help="Directory to save execution artifacts (visualizations, JSON).")
     add_device_args(parser, default='cpu')
     parser.add_argument('--input_size', type=int, default=384, help="Model structural input square dimension scale limit.")
     
     parser.add_argument('--save_json', action='store_true', default=True, help="Flag to export explicit numeric result limits coordinates to a JSON payload.")
     parser.add_argument('--save_vis', action='store_true', default=True, help="Flag to generate and save a visualization overlaid upon the absolute original image scale.")
     parser.add_argument('--no_vis', action='store_true', default=False, help="Suppresses any visual artifact generations.")
+    parser.add_argument('--pytorch', action='store_true', help="Load PyTorch checkpoint (.pt) instead of TorchScript model.")
     
     parser.add_argument('--score_threshold', type=float, default=0.5, help="Minimum global pool inference bound target confidence required for bounds map output acceptance.")
     parser.add_argument('--print_coordinates', action='store_true', default=True, help="Dumps the raw parsed map scale geometry structs vector payloads explicitly into console bounds.")
@@ -111,7 +114,7 @@ def save_visualization(image: Image.Image, corners_norm: list, corners_px: List[
         cv2.putText(img_np, label, (pt[0] + 12, pt[1] + 12), font, font_scale, color_pred, thickness)
 
     base_name = os.path.basename(img_path)
-    out_path = os.path.join(output_dir, f"infer_{base_name}")
+    out_path = os.path.join(output_dir, base_name)
     cv2.imwrite(out_path, img_np)
 
 def process_image(img_path: str, model: Any, args: argparse.Namespace, device: torch.device, logger: logging.Logger, is_dir_mode: bool) -> Optional[Dict[str, float]]:
@@ -164,7 +167,8 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
                 img_path, args.output_dir
             )
         
-    json_path = os.path.join(args.output_dir, f"result_{os.path.basename(img_path)}.json")
+    json_name = os.path.splitext(os.path.basename(img_path))[0] + ".json"
+    json_path = os.path.join(args.output_dir, json_name)
     if args.save_json:
         out_data = {
             'image_file': img_path,
@@ -206,7 +210,7 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
             logger.info(f"  {labels[i]:13s}: ({px}, {py})")
             
         if not args.no_vis and args.save_vis:
-            logger.info(f"\nSaved visualization to: {args.output_dir}/infer_{os.path.basename(img_path)}")
+            logger.info(f"\nSaved visualization to: {os.path.join(args.output_dir, os.path.basename(img_path))}")
         if args.save_json:
             logger.info(f"Saved coarse results for refiner Stage 2 Stage to: {json_path}")
 
@@ -228,27 +232,21 @@ def main() -> None:
     t_start_total = sync_time()
     args = parse_args()
     
-    if args.run_dir:
-        run_dir = args.run_dir
-    else:
-        weights_dir = os.path.dirname(os.path.abspath(args.model))
-        parent_dir = os.path.dirname(weights_dir)
-        if os.path.basename(weights_dir) == 'checkpoints':
-            run_dir = parent_dir
+    if not args.output_dir:
+        input_p = os.path.abspath(args.image)
+        if os.path.isdir(input_p):
+            input_base = input_p.rstrip('\\/')
         else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = os.path.join('.', 'runs', f"inference_{timestamp}")
-            
-    os.makedirs(run_dir, exist_ok=True)
-    log_dir = os.path.join(run_dir, 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    
-    logger = setup_logging(os.path.join(log_dir, 'inference.log'))
-    logger.info("=== TorchScript Inference Pipeline ===")
-    logger.info(f"Mapped output directory: {run_dir}")
-    
-    args.output_dir = os.path.join(run_dir, 'inference_outputs')
+            input_base = os.path.dirname(input_p)
+        args.output_dir = input_base + "_cropped"
+        
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Setup logging in the output dir
+    log_file = os.path.join(args.output_dir, 'inference.log')
+    logger = setup_logging(log_file)
+    logger.info("=== TorchScript Inference Pipeline ===")
+    logger.info(f"Output directory: {args.output_dir}")
         
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
@@ -257,9 +255,8 @@ def main() -> None:
     image_paths = []
     is_dir_mode = os.path.isdir(args.image)
     if is_dir_mode:
-        for ext in ('*.jpg', '*.jpeg', '*.png'):
+        for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG'):
             image_paths.extend(glob.glob(os.path.join(args.image, ext)))
-            image_paths.extend(glob.glob(os.path.join(args.image, ext.upper())))
         image_paths = sorted(list(set(image_paths)))
     else:
         if not os.path.exists(args.image):
@@ -276,10 +273,17 @@ def main() -> None:
     # Load Model (Once for all)
     t0 = sync_time()
     try:
-        model = torch.jit.load(args.model, map_location=device)
-        model.eval()
+        if args.pytorch:
+            logger.info(f"Loading Coarse model (PyTorch): {args.model}")
+            model = CoarseQuadNet().to(device)
+            load_checkpoint(model, None, None, args.model, device=device)
+            model.eval()
+        else:
+            logger.info(f"Loading Coarse model (TorchScript): {args.model}")
+            model = torch.jit.load(args.model, map_location=device)
+            model.eval()
     except Exception as e:
-        logger.error(f"Failed to load TorchScript model: {e}")
+        logger.error(f"Failed to load model: {e}")
         return
     t_load_model = sync_time() - t0
     

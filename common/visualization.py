@@ -248,7 +248,6 @@ def save_diagnostic_visualization(
 
     # Combine into a horizontal strip
     combined = np.hstack(strips)
-    
     os.makedirs(output_dir, exist_ok=True)
     fname = os.path.basename(img_path)
     cv2.imwrite(os.path.join(output_dir, fname), combined)

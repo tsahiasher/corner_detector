@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, scheduler: Optional[torch.optim.lr_scheduler._LRScheduler], epoch: int, best_metric: float, path: str) -> None:
+def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, scheduler: Optional[torch.optim.lr_scheduler._LRScheduler], epoch: int, best_metric: float, path: str, **kwargs) -> None:
     """Saves a model checkpoint payload to disk, including optimizer and scheduler states.
     
     Args:
@@ -15,6 +15,7 @@ def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, sc
         epoch (int): Current epoch number.
         best_metric (float): Best recorded validation metric (e.g., mean pixel error).
         path (str): Output file path.
+        **kwargs: Additional metadata to store in the checkpoint (e.g., best_score tuple).
     """
     state_dict: Dict[str, Any] = {
         'epoch': epoch,
@@ -22,6 +23,9 @@ def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, sc
         'optimizer_state_dict': optimizer.state_dict(),
         'best_metric': best_metric
     }
+    # Merge additional kwargs
+    state_dict.update(kwargs)
+    
     if scheduler is not None:
         state_dict['scheduler_state_dict'] = scheduler.state_dict()
     try:

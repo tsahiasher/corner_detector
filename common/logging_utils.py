@@ -86,7 +86,13 @@ class TrainingTracker:
 
         # Patch Recall
         if recall:
-            rec_str = " | ".join([f"{k[7:]}px: {recall[k]:.1f}%" for k in sorted(recall.keys())])
+            items = []
+            for k in sorted(recall.keys()):
+                label = k[7:] # remove 'recall_'
+                if not label.endswith('px'):
+                    label = f"{label}px"
+                items.append(f"{label}: {recall[k]:.1f}%")
+            rec_str = " | ".join(items)
             self.logger.info(f"Patch Recall: {rec_str}")
 
 

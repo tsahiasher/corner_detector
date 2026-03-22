@@ -218,7 +218,7 @@ def main() -> None:
         tracker.start_val_phase()
         all_errs = []
         top_tracker = TopLossTracker(k=5)
-
+        
         val_pbar = tqdm(val_loader, desc=f"Val Epoch {epoch+1}", leave=False)
         with torch.inference_mode():
             for batch in val_pbar:

@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Main export function for PatchRefinerNet."""
     args = parse_args()
+    
+    # Ensure output is in the same directory as weights if not explicitly directed elsewhere
+    if not os.path.isabs(args.output) and os.path.dirname(args.output) == '':
+        weights_dir = os.path.dirname(os.path.abspath(args.weights))
+        args.output = os.path.join(weights_dir, args.output)
+        
     from datetime import datetime
 
     if args.run_dir:
@@ -121,8 +127,15 @@ def main() -> None:
                 v_input = torch.randn(*input_shape).to(device)
                 eager_out = model(v_input)
                 traced_out = exported(v_input)
-                err = torch.abs(eager_out - traced_out).max().item()
-                max_err = max(max_err, err)
+                
+                # Handle multi-tensor outputs (tuple)
+                if isinstance(eager_out, (list, tuple)):
+                    for eo, to in zip(eager_out, traced_out):
+                        err = torch.abs(eo - to).max().item()
+                        max_err = max(max_err, err)
+                else:
+                    err = torch.abs(eager_out - traced_out).max().item()
+                    max_err = max(max_err, err)
 
         logger.info(f"Max absolute error: {max_err:.6e}")
         if max_err > 1e-4:
@@ -138,7 +151,12 @@ def main() -> None:
         cpu_input = torch.randn(*input_shape).to('cpu')
         with torch.inference_mode():
             out = reloaded(cpu_input)
-        logger.info(f"Reload successful. Output shape: {out.shape}")
+        
+        if isinstance(out, (list, tuple)):
+            shapes = [o.shape for o in out]
+            logger.info(f"Reload successful. Output shapes: {shapes}")
+        else:
+            logger.info(f"Reload successful. Output shape: {out.shape}")
     except Exception as e:
         logger.error(f"Reload check failed: {e}")
         return

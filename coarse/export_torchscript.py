@@ -5,7 +5,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import logging
+from typing import Dict, List, Optional, Tuple, Any
 import torch
+import torch.nn as nn
 
 from coarse.models.coarse_quad_net import CoarseQuadNet
 from common.checkpoint import load_checkpoint
@@ -47,6 +49,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    
+    # Ensure output is in the same directory as weights if not explicitly directed elsewhere
+    if not os.path.isabs(args.output) and os.path.dirname(args.output) == '':
+        weights_dir = os.path.dirname(os.path.abspath(args.weights))
+        args.output = os.path.join(weights_dir, args.output)
+        
     from datetime import datetime
     
     if args.run_dir:
@@ -76,9 +84,13 @@ def main() -> None:
     log_device_info(device, args.device, logger)
     
     # 1. Load Model
-    model = CoarseQuadNet().to(device)
+    eager_model = CoarseQuadNet().to(device)
     logger.info(f"Loading checkpoint weights from: {args.weights}")
-    load_checkpoint(model, None, None, args.weights, device=device)
+    load_checkpoint(eager_model, None, None, args.weights, device=device)
+    eager_model.eval()
+
+    # Use the model directly as orientation reordering is now handled in forward()
+    model = eager_model
     model.eval()
     
     input_shape = (1, 3, args.input_height, args.input_width)
