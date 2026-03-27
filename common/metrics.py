@@ -115,42 +115,55 @@ class WingLoss(nn.Module):
         return loss.mean()
 
 
-class SoftArgmax2D(nn.Module):
-    """
-    Differentiable Soft-Argmax for sub-pixel heatmap localization.
-    Maps a heatmap to [0, 1] coordinates.
-    """
-    def __init__(self, beta: float = 10.0):
-        super().__init__()
-        self.beta = beta
+class CenterOffsetL1Loss(nn.Module):
+    """L1 Loss for the 8 spatial offsets supervised ONLY at the exact true GT center grid location."""
+    def forward(self, pred_offsets: torch.Tensor, gt_centers: torch.Tensor, gt_corners: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = pred_offsets.shape
+        device = pred_offsets.device
+        
+        # True center integer locations
+        center_grid_x = gt_centers[:, 0, 0] * W
+        center_grid_y = gt_centers[:, 0, 1] * H
+        
+        idx_x = torch.clamp(torch.floor(center_grid_x).long(), 0, W - 1)
+        idx_y = torch.clamp(torch.floor(center_grid_y).long(), 0, H - 1)
+        
+        # Calculate exactly what the 8 offsets should be to hit the 4 visual corners
+        # We work in normalized [0, 1] space for stability, meaning target offsets are in [-1, 1]
+        target_offsets = []
+        for c in range(4):
+            # dx = gt_corner_norm_x - clamped_anchor_grid_norm_x
+            dx = gt_corners[:, c, 0] - (idx_x.float() / W)
+            dy = gt_corners[:, c, 1] - (idx_y.float() / H)
+            target_offsets.extend([dx, dy])
+            
+        gt_target_offsets = torch.stack(target_offsets, dim=1) # [B, 8]
+        
+        # Gather predictions at center location and apply EXACT SAME Tanh gate as inference
+        # This is critical: if inference uses tanh(raw)*0.75, training MUST compare tanh(pred)*0.75 vs GT
+        b_idx = torch.arange(B, device=device)
+        pred_raw = pred_offsets[b_idx, :, idx_y, idx_x] # [B, 8] raw network output
+        pred = torch.tanh(pred_raw) * 0.75               # [B, 8] same Tanh gate as inference!
+        
+        return F.l1_loss(pred, gt_target_offsets, reduction='mean')
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Input: [B, H, W] or [B, 1, H, W]
-        Output: [B, 2] in [0, 1]
-        """
-        if x.dim() == 4:
-            x = x.squeeze(1)
-        B, H, W = x.shape
-        device = x.device
 
-        # Softmax over spatial dimensions
-        flat_x = x.view(B, -1)
-        weights = F.softmax(flat_x * self.beta, dim=-1)
-        weights = weights.view(B, H, W)
-
-        # Create coordinate grids
-        pos_y, pos_x = torch.meshgrid(
-            torch.linspace(0, 1, H, device=device),
-            torch.linspace(0, 1, W, device=device),
-            indexing='ij'
-        )
-
-        # Weighted average
-        expected_y = torch.sum(weights * pos_y, dim=(1, 2))
-        expected_x = torch.sum(weights * pos_x, dim=(1, 2))
-
-        return torch.stack([expected_x, expected_y], dim=-1)
+class CenterOrientLoss(nn.Module):
+    """Cross Entropy for the orientation supervised ONLY at the exact true GT center grid location."""
+    def forward(self, pred_dense_orient: torch.Tensor, gt_centers: torch.Tensor, gt_orient: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = pred_dense_orient.shape
+        device = pred_dense_orient.device
+        
+        center_grid_x = gt_centers[:, 0, 0] * W
+        center_grid_y = gt_centers[:, 0, 1] * H
+        
+        idx_x = torch.clamp(torch.floor(center_grid_x).long(), 0, W - 1)
+        idx_y = torch.clamp(torch.floor(center_grid_y).long(), 0, H - 1)
+        
+        b_idx = torch.arange(B, device=device)
+        pred_logits = pred_dense_orient[b_idx, :, idx_y, idx_x] # [B, 4]
+        
+        return F.cross_entropy(pred_logits, gt_orient)
 
 
 class QuadShapeLoss(nn.Module):
@@ -302,11 +315,17 @@ class HomographyReprojectionLoss(nn.Module):
         return F.smooth_l1_loss(project(H_pred, grid), project(H_gt, grid))
 
 
-class HeatmapLoss(nn.Module):
-    """Gaussian heatmap loss for corner supervision."""
-    def __init__(self, sigma: float = 1.0) -> None:
+class HeatmapFocalLoss(nn.Module):
+    """Gaussian heatmap loss for corner supervision using keypoint Focal Loss.
+    
+    Prevents background (0s) from overwhelmingly dominating sparse peaks (1s).
+    Based on CornerNet/CenterNet formulations.
+    """
+    def __init__(self, sigma: float = 2.0, alpha: float = 2.0, beta: float = 4.0) -> None:
         super().__init__()
         self.sigma = sigma
+        self.alpha = alpha
+        self.beta = beta
 
     def forward(self, pred_heatmaps: torch.Tensor, gt_corners: torch.Tensor) -> torch.Tensor:
         """
@@ -317,20 +336,42 @@ class HeatmapLoss(nn.Module):
         B, C, H, W = pred_heatmaps.size()
         device = pred_heatmaps.device
         
-        # Generate target Gaussian heatmaps
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(H, device=device).float(),
-            torch.arange(W, device=device).float(),
-            indexing='ij'
-        )
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).unsqueeze(0) # [1, 1, H, W, 2]
+        # 1. Generate target Gaussian heatmaps
+        yy = torch.linspace(0, H - 1, H, device=device)
+        xx = torch.linspace(0, W - 1, W, device=device)
+        grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
+        grid = torch.stack([grid_x, grid_y], dim=-1) # [H, W, 2]
         
-        # Scale GT to pixel coords [B, 4, 1, 1, 2]
-        gt_px = gt_corners.view(B, C, 1, 1, 2) * torch.tensor([W, H], device=device).view(1, 1, 1, 1, 2)
+        # Gaussian anchors MUST be placed EXACTLY at integer coordinate bounds
+        # Otherwise target.eq(1) fails across the floating-point gap, suppressing all positive gradients!
+        gt_px = gt_corners.view(B, C, 1, 1, 2) * torch.tensor([W, H], device=device, dtype=torch.float32).view(1, 1, 1, 1, 2)
+        gt_px_int = torch.floor(gt_px)
+        gt_px_int[..., 0] = torch.clamp(gt_px_int[..., 0], 0, W - 1)
+        gt_px_int[..., 1] = torch.clamp(gt_px_int[..., 1], 0, H - 1)
         
-        # Gaussian: [B, 4, H, W]
-        dist_sq = torch.sum((grid - gt_px) ** 2, dim=-1)
+        dist_sq = torch.sum((grid.view(1, 1, H, W, 2) - gt_px_int) ** 2, dim=-1)
         target = torch.exp(-dist_sq / (2 * self.sigma ** 2))
         
-        # Supervise sigmoid heatmaps
-        return F.mse_loss(torch.sigmoid(pred_heatmaps), target)
+        # 2. Keypoint Focal Loss
+        pred = torch.clamp(torch.sigmoid(pred_heatmaps), min=1e-4, max=1-1e-4)
+        
+        # Exact peaks (target behaves as 1)
+        pos_inds = target.eq(1).float()
+        neg_inds = target.lt(1).float()
+        
+        neg_weights = torch.pow(1 - target, self.beta)
+        
+        loss_pos = torch.log(pred) * torch.pow(1 - pred, self.alpha) * pos_inds
+        loss_neg = torch.log(1 - pred) * torch.pow(pred, self.alpha) * neg_weights * neg_inds
+        
+        num_pos = pos_inds.sum()
+        
+        loss_pos = loss_pos.sum()
+        loss_neg = loss_neg.sum()
+        
+        if num_pos == 0:
+            loss = -loss_neg
+        else:
+            loss = -(loss_pos + loss_neg) / num_pos
+            
+        return loss

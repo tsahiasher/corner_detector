@@ -16,9 +16,9 @@ from coarse.datasets.yolo_keypoint_dataset import YOLOKeypointDataset
 from coarse.datasets.coco_val_dataset import COCOValDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
-from common.metrics import (DiceLoss, WingLoss, GeometryAlignmentLoss, 
-                            QuadShapeLoss, calculate_accuracy_metrics, 
-                            compute_patch_recall)
+from common.metrics import (DiceLoss, GeometryAlignmentLoss, HeatmapFocalLoss, 
+                            calculate_accuracy_metrics, compute_patch_recall, 
+                            CenterOffsetL1Loss)
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.logging_utils import TrainingTracker, TopLossTracker, HardExampleMiner
 from common.visualization import save_diagnostic_visualization
@@ -60,17 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pin_memory', action='store_true', default=True, help="Use pinned memory for faster GPU transfer.")
     parser.add_argument('--grad_clip', type=float, default=1.0, help="Gradient clipping value (0 to disable).")
     
-    # Structured Loss Weights (v6)
-    parser.add_argument('--w_coord', type=float, default=2.5, help="Primary WingLoss on 4 ordered corners.")
-    parser.add_argument('--w_mask', type=float, default=0.5, help="Dense Mask supervision.")
-    parser.add_argument('--w_edge', type=float, default=2.0, help="Dense Boundary/Contour supervision (Gaussian/v2).")
-    parser.add_argument('--w_shape', type=float, default=0.5, help="Quad shape regularizer (Clockwise/Convex).")
-    parser.add_argument('--w_reg', type=float, default=0.1, help="L2 Regularization on corner residuals.")
-    parser.add_argument('--w_align', type=float, default=1.0, help="Geometry Alignment (Corners to Gaussian Edges).")
-    parser.add_argument('--w_score', type=float, default=0.1, help="Confidence Score.")
-    
+    # Simplified Loss Weights (v8.0 - orient head removed)
+    parser.add_argument('--w_offset', type=float, default=1.0, help="Dense Sub-grid Offset L1 Loss.")
+    parser.add_argument('--w_heatmap', type=float, default=1.0, help="Dense Heatmap supervision (Focal Loss).")
+    parser.add_argument('--w_coord_quad', type=float, default=0.5, help="Auxiliary global quad anchoring loss.")
+
     # Mining
-    parser.add_argument('--mine_hard', action='store_true', default=True, help="Enable hard example mining via WeightedRandomSampler.")
+    parser.add_argument('--mine_hard', action='store_true', default=True, help="Enable hard example mining.")
     parser.add_argument('--mine_exponent', type=float, default=1.5, help="Aggressiveness of hard mining (weight = error ^ exponent).")
 
     add_device_args(parser, default='auto')
@@ -92,7 +88,7 @@ def main() -> None:
 
     logger = setup_logging(os.path.join(run_dir, 'logs', 'train.log'))
     logger.info(f"Run directory: {run_dir}")
-    logger.info(f"Structured Loss Config: Coord={args.w_coord}, Mask={args.w_mask}, Edge={args.w_edge}, Align={args.w_align}, Shape={args.w_shape}")
+    logger.info(f"Stage 1 Redesign Losses: Heatmap={args.w_heatmap}, DenseCoord={args.w_offset}, QuadCoord={args.w_coord_quad}")
     
     tracker = TrainingTracker(logger)
     set_seed(42)
@@ -106,35 +102,30 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
                               num_workers=args.num_workers, pin_memory=args.pin_memory)
 
-    miner = HardExampleMiner(len(train_dataset))
-
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
                             num_workers=args.num_workers, pin_memory=args.pin_memory)
 
     model = CoarseQuadNet().to(device)
     param_count = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model: Structured CoarseQuadNet | Parameters: {param_count:,}")
+    logger.info(f"Model: Dense-Primary CoarseQuadNet | Parameters: {param_count:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Criterions
-    score_criterion = nn.BCELoss()
-    coord_criterion = WingLoss(wing_w=5.0, epsilon=1.0) 
-    dice_criterion = DiceLoss()
-    bce_dense_criterion = nn.BCELoss()
-    align_criterion = GeometryAlignmentLoss()
-    shape_criterion = QuadShapeLoss(weight_diag=0.5, weight_convex=1.5)
+    # Loss Functions (v8.0)
+    heatmap_criterion = HeatmapFocalLoss(alpha=2.0, beta=4.0)
+    offset_criterion = CenterOffsetL1Loss()
 
     start_epoch = 0
     best_mean_error = float('inf')
+    best_recall_96 = 0.0
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
         checkpoint = load_checkpoint(model, optimizer, scheduler, args.resume, device=device)
         if checkpoint:
             start_epoch = checkpoint.get('epoch', 0)
-            best_mean_error = checkpoint.get('best_metric', float('inf'))
-            logger.info(f"Restored checkpoint at epoch {start_epoch} (best: {best_mean_error:.3f})")
+            best_recall_96 = checkpoint.get('best_metric', 0.0)
+            logger.info(f"Restored checkpoint at epoch {start_epoch} (best recall: {best_recall_96:.2f})")
 
     miner = HardExampleMiner(len(train_loader.dataset))
     
@@ -147,12 +138,10 @@ def main() -> None:
         model.train()
         tracker.start_train_phase()
         
-        # Performance Boost v2: Dynamic Aggressiveness
-        # Gradually increase exponent from 1.0 to 2.5 over epochs to focus on remaining hard cases
+        # Dynamic Aggressiveness
         current_exponent = 1.0 + (args.mine_exponent - 1.0) * (epoch / max(1, args.epochs - 1))
         
-        # Update Weighted Sampler every epoch if mining is enabled
-        if args.mine_hard and epoch > 0:
+        if args.mine_hard and epoch >= 10:
             weights = miner.get_weights(exponent=current_exponent)
             sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset), replacement=True)
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler,
@@ -168,50 +157,72 @@ def main() -> None:
             out = model(batch['image'])
             gt_corners = batch['corners']
             
-            # 1. Coordinate Accuracy (Ordered 4 Corners)
-            loss_coord = coord_criterion(out['corners'], gt_corners)
-
-            # 2. Geometric Anchoring (Mask + Boundary)
-            loss_mask = 0.5 * dice_criterion(out['mask'], batch['mask']) + 0.5 * bce_dense_criterion(out['mask'], batch['mask'])
-            loss_edge = 0.5 * dice_criterion(out['edges'], batch['edges']) + 0.5 * bce_dense_criterion(out['edges'], batch['edges'])
+            # --- Dynamic Corner Sorting (Physical to Visual) ---
+            # CNN heatmaps/offsets are explicitly trained on 'visual' spatial geometry.
+            centroid = gt_corners.mean(dim=1, keepdim=True) # [B, 1, 2]
+            diffs = gt_corners - centroid
+            angles = torch.atan2(diffs[:, :, 1], diffs[:, :, 0]) # [B, 4]
+            sort_idx = torch.argsort(angles, dim=1) # [B, 4]
             
-            # 3. Shape & Parameter Regularization
-            loss_shape = shape_criterion(out['corners'])
-            loss_reg = torch.mean(out['residuals'] ** 2)
-
-            # 4. Alignment
-            loss_align = align_criterion(out['corners'], out['edges'].detach(), out['mask'].detach())
+            B_cur = gt_corners.size(0)
+            b_idx_t = torch.arange(B_cur, device=device).unsqueeze(1).expand(B_cur, 4)
+            gt_corners_visual = gt_corners[b_idx_t, sort_idx] # [B, 4, 2]
             
-            # 5. Confidence
-            loss_score = score_criterion(out['score'], torch.ones_like(out['score']))
+            # The 'shift' mapping visual back to physical is simply the physical index of the visual TL
+            gt_orient = sort_idx[:, 0] # [B]
             
-            total_loss = (loss_coord * args.w_coord + 
-                          loss_mask * args.w_mask + 
-                          loss_edge * args.w_edge + 
-                          loss_shape * args.w_shape + 
-                          loss_reg * args.w_reg +
-                          loss_align * args.w_align + 
-                          loss_score * args.w_score)
+            # Compute Exact Centroid [B, 1, 2]
+            gt_centers = gt_corners_visual.mean(dim=1, keepdim=True)
+            
+            # 1. Primary Dense Spatial Supervision
+            loss_offset = offset_criterion(out['dense_offsets'], gt_centers, gt_corners_visual)
+            loss_heatmap = heatmap_criterion(out['dense_center'], gt_centers)
+            
+            total_loss = (loss_offset * args.w_offset + 
+                          loss_heatmap * args.w_heatmap)
             
             total_loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            tracker.record_batch('train', total_loss.item(), sync_time() - batch_start)
+            # Detailed component logging (v8.0)
+            components = {
+                'offset_raw': loss_offset.item(),
+                'offset_w': (loss_offset * args.w_offset).item(),
+                'heatmap_raw': loss_heatmap.item(),
+                'heatmap_w': (loss_heatmap * args.w_heatmap).item(),
+            }
+            tracker.record_batch('train', total_loss.item(), sync_time() - batch_start, components=components)
             train_pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
-
+            
             # Update Miner with per-sample errors (Pixel space)
             with torch.no_grad():
                 w_orig = batch.get('orig_width', torch.tensor(args.image_size, device=device)).view(-1, 1)
                 h_orig = batch.get('orig_height', torch.tensor(args.image_size, device=device)).view(-1, 1)
-                diff = (out['corners'] - gt_corners).abs()
+                
+                # Use geometric visual corners for geometric mining
+                diff = (out['corners_visual'] - gt_corners_visual).abs()
                 diff[:, :, 0] *= w_orig
                 diff[:, :, 1] *= h_orig
-                dist = torch.norm(diff, dim=-1).mean(dim=-1) # Mean pixel error per image
-                miner.update(batch['index'].tolist(), dist.cpu().tolist())
+                
+                # Mining: Worst-corner prioritization
+                dist_max = torch.norm(diff, dim=-1).max(dim=-1)[0] # max error per image [B]
+                
+                weights = []
+                for b_idx in range(gt_corners.size(0)):
+                    d = dist_max[b_idx].item()
+                    w = d
+                    if d > 48.0:
+                        w *= 5.0 # heavily penalize corners falling outside the 96px capture box
+                    weights.append(w)
+                miner.update(batch['index'].tolist(), weights)
+
+            del out, batch, total_loss, components
+            del loss_offset, loss_heatmap
 
         tracker.end_train_phase()
+        torch.cuda.empty_cache()
 
         # === Validation ===
         model.eval()
@@ -227,17 +238,38 @@ def main() -> None:
                 out = model(batch['image'])
                 gt_corners = batch['corners']
                 
-                # Val Loss tracking
-                l_coord = coord_criterion(out['corners'], gt_corners)
-                val_total_loss = l_coord * args.w_coord 
+                # --- Dynamic Corner Sorting (Physical to Visual) ---
+                centroid = gt_corners.mean(dim=1, keepdim=True) # [B, 1, 2]
+                diffs = gt_corners - centroid
+                angles = torch.atan2(diffs[:, :, 1], diffs[:, :, 0]) # [B, 4]
+                sort_idx = torch.argsort(angles, dim=1) # [B, 4]
                 
-                tracker.record_batch('val', val_total_loss.item(), sync_time() - batch_start)
+                B_cur = gt_corners.size(0)
+                b_idx_t = torch.arange(B_cur, device=device).unsqueeze(1).expand(B_cur, 4)
+                gt_corners_visual = gt_corners[b_idx_t, sort_idx] # [B, 4, 2]
+                gt_orient = sort_idx[:, 0] # [B]
+                gt_centers = gt_corners_visual.mean(dim=1, keepdim=True)
+                
+                # Val Loss tracking
+                loss_offset = offset_criterion(out['dense_offsets'], gt_centers, gt_corners_visual)
+                loss_heatmap = heatmap_criterion(out['dense_center'], gt_centers)
+                
+                val_total_loss = (loss_offset * args.w_offset + 
+                                  loss_heatmap * args.w_heatmap)
+                
+                components = {
+                    'offset_raw': loss_offset.item(),
+                    'offset_w': (loss_offset * args.w_offset).item(),
+                    'heatmap_raw': loss_heatmap.item(),
+                    'heatmap_w': (loss_heatmap * args.w_heatmap).item(),
+                }
+                tracker.record_batch('val', val_total_loss.item(), sync_time() - batch_start, components=components)
 
                 # Accuracy (Pixel Space)
                 w_orig = batch.get('orig_width', torch.tensor(args.image_size, device=device)).view(-1, 1)
                 h_orig = batch.get('orig_height', torch.tensor(args.image_size, device=device)).view(-1, 1)
 
-                diff = (out['corners'] - gt_corners).abs()
+                diff = (out['corners'] - gt_corners_visual).abs()
                 diff[:, :, 0] *= w_orig
                 diff[:, :, 1] *= h_orig
                 dist = torch.norm(diff, dim=-1) # [B, 4]
@@ -250,12 +282,15 @@ def main() -> None:
                         'image': batch['image'][b_idx],
                         'pred': out['corners'][b_idx],
                         'gt': gt_corners[b_idx],
-                        'mask': out['mask'][b_idx],
-                        'edges': out['edges'][b_idx],
                         'path': batch['img_path'][b_idx]
                     })
+                
+                # Explicitly free variables
+                del out, batch, val_total_loss, components
+                del loss_offset, loss_heatmap
 
         tracker.end_val_phase()
+        torch.cuda.empty_cache()
 
         # Metrics
         errors = torch.cat(all_errs, dim=0)
@@ -271,22 +306,32 @@ def main() -> None:
         for sample in top_tracker.get_samples():
             save_diagnostic_visualization(
                 sample['image'], sample['pred'], sample['gt'],
-                sample['mask'], sample['edges'],
+                None, None, # No mask/edges in redesigned version
                 sample['path'], epoch_vis_dir
             )
 
-        # Checkpoint
+        # Checkpoint (Targeting recall_96 explicitly)
         latest_path = os.path.join(run_dir, 'checkpoints', 'last.pt')
-        save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics['mean'], latest_path)
+        save_checkpoint(model, optimizer, scheduler, epoch + 1, recall_val['recall_96'], latest_path)
         
-        if metrics['mean'] < best_mean_error:
-            best_mean_error = metrics['mean']
+        current_recall = recall_val['recall_96']
+        current_mean = metrics['mean']
+        
+        is_better = False
+        if current_recall > best_recall_96:
+            is_better = True
+        elif current_recall == best_recall_96 and current_mean < best_mean_error:
+            is_better = True
+            
+        if is_better:
+            best_recall_96 = current_recall
+            best_mean_error = current_mean
             best_path = os.path.join(run_dir, 'checkpoints', 'best.pt')
-            save_checkpoint(model, optimizer, scheduler, epoch + 1, best_mean_error, best_path)
-            logger.info(f"New best model: {best_path} (mean_err={best_mean_error:.3f})")
+            save_checkpoint(model, optimizer, scheduler, epoch + 1, best_recall_96, best_path)
+            logger.info(f"New best model: {best_path} (recall_96={best_recall_96:.1f}%, mean_err={best_mean_error:.3f})")
 
     total_time = (sync_time() - global_start_time) / 60
-    logger.info(f"Training finished in {total_time:.1f}m. Best Mean Error: {best_mean_error:.3f}")
+    logger.info(f"Training finished in {total_time:.1f}m. Best Recall@96: {best_recall_96:.1f}%")
 
 
 if __name__ == "__main__":

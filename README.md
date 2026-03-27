@@ -1,6 +1,6 @@
 # ID Card Corner Detection Pipeline
 
-A production-grade, two-stage geometric machine learning pipeline for accurate high-speed CPU-first document extraction.
+A production-grade, three-stage geometric machine learning pipeline for accurate high-speed CPU-first document extraction.
 
 ## Project Directory Structure
 
@@ -8,37 +8,40 @@ A production-grade, two-stage geometric machine learning pipeline for accurate h
 corner_detection/
 ├── coarse/                     (Stage 1: Coarse Quad Detection)
 │   ├── datasets/               (YOLO/COCO parsing with Mask/Edge generation)
-│   ├── models/                 (MobileNetV3 backbone + Homography Head)
+│   ├── models/                 (CenterNet backbone + FPN + dilated refinement)
 │   ├── runs/                   (Training logs, checkpoints, visualizations)
-│   ├── train.py                (Multi-task training entry point)
+│   ├── train.py                (Training entry point)
 │   ├── test.py                 (Evaluation with diagnostics)
 │   └── export_torchscript.py   (Export Stage 1 to TorchScript)
+├── orient/                     (Stage 2.5: Orientation Classification)
+│   ├── datasets/               (Warp-then-classify dataset)
+│   ├── models/                 (OrientNet: ~50k param classifier)
+│   ├── runs/                   (Training logs, checkpoints)
+│   ├── train.py                (Orientation classifier training)
+│   ├── test.py                 (Evaluation: overall + per-class accuracy)
+│   ├── export_torchscript.py   (Export Stage 2.5 to TorchScript)
+│   └── run_torchscript_image.py (Standalone coarse+orient inference)
 ├── refiner/                    (Stage 2: Sub-Pixel Patch Refinement)
 │   ├── datasets/               (Homography-rectified patch extraction)
-│   ├── models/                 (Lightweight Shared CNN for local refinement)
+│   ├── models/                 (Iterative two-level refinement CNN)
+│   ├── runs/                   (Training logs, checkpoints)
 │   ├── train.py                (Refinement training pipeline)
 │   └── test.py                 (Evaluation of sub-pixel precision)
 ├── common/                     (Shared core utility library)
 │   ├── checkpoint.py           (Weights management)
 │   ├── device.py               (Device-aware orchestration)
 │   ├── geometry.py             (Homography and projection logic)
-│   ├── metrics.py              (Robust metric calculation - NumPy/Tensor)
+│   ├── metrics.py              (Robust metric calculation)
 │   ├── transforms.py           (Geometric data augmentation)
-│   └── visualization.py        (Diagnostic drawing and diagnostic saving)
-├── pipeline/                   (Full Orchestration Stage 1 -> Stage 2)
-├── configs/                    (Hyperparameter definitions)
+│   └── visualization.py        (Diagnostic drawing and saving)
+├── run_torchscript_image.py    (Unified Coarse → Orient → Refiner inference)
 └── debugging_scripts/          (Standalone sanity-check scripts)
 ```
 
+---
+
 ## Stage 1: Coarse Quad Detection
 
-Stage 1 is a **Multi-Task Geometric Network** designed for robustness under arbitrary rotation and perspective.
-
-### Architecture
-- **Backbone**: MobileNetV3-Small (truncated for CPU speed).
-- **Homography Head (MLP)**: Predicts 8 parameters of a 3x3 perspective transform $H$. Projects a canonical square to image-space corners. This ensures the output is *strictly a valid quadrilateral* by construction.
-- **Spatial Corner Head (24x24)**: Predicts high-resolution heatmaps + offsets for initial point localization.
-- **Dense Geometric Head (48x48)**: Predicts a binary Card Mask and Boundary Edge map for global anchoring.
 
 ### Loss Formulation
 Stage 1 uses a **Composite Geometric Loss** to enforce global consistency:

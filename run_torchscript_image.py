@@ -18,8 +18,12 @@ import torchvision.transforms.functional as TF
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
 from common.checkpoint import load_checkpoint
+from common.geometry import compute_homography, warp_image
 from coarse.models.coarse_quad_net import CoarseQuadNet
 from refiner.models.patch_refiner import PatchRefinerNet
+from orient.models.orient_net import OrientNet
+
+ORIENT_LABELS = {0: '0°', 1: '90°', 2: '180°', 3: '270°'}
 
 def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger('unified_inference')
@@ -38,14 +42,18 @@ def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     return logger
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unified Coarse-to-Refined Corner Detection Inference.")
+    parser = argparse.ArgumentParser(description="Unified Coarse → Orient → Refined Corner Detection Inference.")
     parser.add_argument('--coarse_model', '--coarse_mode', type=str, required=True, help="Path to Stage 1 (Coarse) model.")
     parser.add_argument('--refiner_model', type=str, required=True, help="Path to Stage 2 (Refiner) TorchScript model.")
+    parser.add_argument('--orient_model', type=str, default='',
+                        help="(Optional) Path to Stage 2.5 (Orient) model. If omitted, orientation correction is skipped.")
     parser.add_argument('--input', type=str, required=True, help="Path to image file or directory.")
     parser.add_argument('--output_dir', type=str, default='', help="Directory to save results. If empty, uses input path + '_cropped'.")
     
     parser.add_argument('--coarse_size', type=int, default=384, help="Input size for Coarse model.")
     parser.add_argument('--patch_size', type=int, default=96, help="Patch size for Refiner model.")
+    parser.add_argument('--orient_crop_size', type=int, default=128,
+                        help="Canonical crop size fed to OrientNet.")
     
     add_device_args(parser, default='cpu')
     parser.add_argument('--save_json', action='store_true', default=True, help="Save numeric results to JSON.")
@@ -86,6 +94,16 @@ def preprocess_patch(patch_np: np.ndarray, device: torch.device) -> torch.Tensor
     tensor = TF.normalize(tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     return tensor.unsqueeze(0).to(device)
 
+def warp_card_crop(img_rgb_np: np.ndarray, corners_px: List[List[float]],
+                   crop_size: int) -> np.ndarray:
+    """Warps the 4-corner card quad to a canonical square crop."""
+    s   = float(crop_size)
+    dst = np.array([[0, 0], [s, 0], [s, s], [0, s]], dtype=np.float32)
+    src = np.array(corners_px, dtype=np.float32)
+    H   = compute_homography(src, dst)
+    return warp_image(img_rgb_np, H, (crop_size, crop_size))
+
+
 def draw_results(img_bgr: np.ndarray, coarse_pts: List[List[float]], refined_pts: List[List[float]]) -> np.ndarray:
     vis = img_bgr.copy()
     h, w = vis.shape[:2]
@@ -119,7 +137,8 @@ def draw_results(img_bgr: np.ndarray, coarse_pts: List[List[float]], refined_pts
 
     return vis
 
-def process_single_image(img_path: str, coarse_model: Any, refiner_model: Any, 
+def process_single_image(img_path: str, coarse_model: Any, refiner_model: Any,
+                         orient_model: Optional[Any],
                          args: argparse.Namespace, device: torch.device, logger: logging.Logger):
     t_start = sync_time()
     
@@ -149,11 +168,29 @@ def process_single_image(img_path: str, coarse_model: Any, refiner_model: Any,
         py = ny * orig_h
         coarse_pts_px.append([px, py])
     t_coarse = sync_time() - t_c0
+
+    # Step 2 (optional): Orientation Classification
+    orient_class = None
+    t_orient = 0.0
+    img_rgb_np = np.array(pil_img)
+    if orient_model is not None:
+        t_o0 = sync_time()
+        crop_np = warp_card_crop(img_rgb_np, coarse_pts_px, args.orient_crop_size)
+        crop_pil = Image.fromarray(crop_np)
+        crop_t = TF.to_tensor(crop_pil)
+        crop_t = TF.normalize(crop_t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        crop_t = crop_t.unsqueeze(0).to(device)
+        with torch.inference_mode():
+            orient_logits = orient_model(crop_t)
+        orient_class = int(orient_logits.argmax(dim=-1).item())
+        # Cyclically shift corners so corners[0] is the physical TL
+        n = len(coarse_pts_px)
+        coarse_pts_px = [coarse_pts_px[(i + orient_class) % n] for i in range(n)]
+        t_orient = sync_time() - t_o0
     
-    # Step 2: Patch Refinement
+    # Step 3: Patch Refinement
     t_r0 = sync_time()
     refined_pts_px = []
-    img_rgb_np = np.array(pil_img)
     
     for i in range(4):
         cx, cy = coarse_pts_px[i]
@@ -190,8 +227,11 @@ def process_single_image(img_path: str, coarse_model: Any, refiner_model: Any,
             'image': img_path,
             'coarse_corners': coarse_pts_px,
             'refined_corners': refined_pts_px,
+            'orient_class': orient_class,
+            'orient_label': ORIENT_LABELS.get(orient_class, 'n/a') if orient_class is not None else 'n/a',
             'times_ms': {
                 'coarse': t_coarse * 1000,
+                'orient': t_orient * 1000,
                 'refine': t_refine * 1000,
                 'total': t_total * 1000
             }
@@ -220,6 +260,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load Models
+    orient_model = None
     if args.pytorch:
         logger.info(f"Loading Coarse model (PyTorch): {args.coarse_model}")
         coarse_model = CoarseQuadNet().to(device)
@@ -230,6 +271,12 @@ def main():
         refiner_model = PatchRefinerNet().to(device)
         load_checkpoint(refiner_model, None, None, args.refiner_model, device=device)
         refiner_model.eval()
+
+        if args.orient_model:
+            logger.info(f"Loading Orient model (PyTorch): {args.orient_model}")
+            orient_model = OrientNet(num_classes=4).to(device)
+            load_checkpoint(orient_model, None, None, args.orient_model, device=device)
+            orient_model.eval()
     else:
         logger.info(f"Loading Coarse model (TorchScript): {args.coarse_model}")
         coarse_model = torch.jit.load(args.coarse_model, map_location=device)
@@ -238,6 +285,14 @@ def main():
         logger.info(f"Loading Refiner model (TorchScript): {args.refiner_model}")
         refiner_model = torch.jit.load(args.refiner_model, map_location=device)
         refiner_model.eval()
+
+        if args.orient_model:
+            logger.info(f"Loading Orient model (TorchScript): {args.orient_model}")
+            orient_model = torch.jit.load(args.orient_model, map_location=device)
+            orient_model.eval()
+
+    if orient_model is None:
+        logger.info('Orient model not provided — semantic corner ordering skipped.')
     
     # Identify images
     image_paths = []
@@ -253,7 +308,8 @@ def main():
     start_time = time.time()
     success_count = 0
     for img_p in image_paths:
-        t = process_single_image(img_p, coarse_model, refiner_model, args, device, logger)
+        t = process_single_image(img_p, coarse_model, refiner_model,
+                                 orient_model, args, device, logger)
         if t is not None:
             success_count += 1
             logger.info(f"  [{success_count}/{len(image_paths)}] {os.path.basename(img_p):30s} | Total: {t*1000:6.1f}ms")

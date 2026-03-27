@@ -7,6 +7,7 @@ from PIL import Image, UnidentifiedImageError
 from typing import Dict, Any, List, Tuple
 
 from common.transforms import get_train_transforms
+from common.geometry import get_visual_orientation
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,14 @@ class COCOValDataset(Dataset):
         # Generate dense geometric targets (96x96 for v2 boost)
         mask_t, edges_t = self.generate_mask_and_edges(keypoints_t, size=96)
         
+        # Calculate absolute orientation based on augmented geometric positions
+        orient_class = get_visual_orientation(keypoints_t)
+        
         return {
             'index': idx,
             'image': image_t,
             'corners': torch.tensor(keypoints_t, dtype=torch.float32),
+            'orient': torch.tensor(orient_class, dtype=torch.long),
             'mask': mask_t,
             'edges': edges_t,
             'img_path': img_path,

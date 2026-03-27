@@ -21,17 +21,28 @@ Do not default to heavyweight generic detectors unless the user explicitly asks 
 
 Use this 4-stage design as the default:
 
-1. **Coarse detector**
+1. **Coarse detector (CenterNet-style Anchor)**
    - Run a lightweight CPU-friendly backbone on a fixed `384x384` input.
-   - Use a spatially aware prediction head. Prefer low-resolution heatmaps with DSNT or soft-argmax, optionally with small residual offsets.
-   - Do not default to pure global average pooling plus direct linear corner regression.
-   - Predict 4 ordered coarse corners and an optional confidence score.
-   - This stage is for robust geometric capture range, not final sub-pixel precision.
+   - **Crucial Pattern**: Do NOT use 4 independent dense heatmaps for the 4 corners. Rigid textured objects (like ID cards) cause extreme false-positive hallucination.
+   - **Crucial Pattern**: Do NOT use `AdaptiveAvgPool` global pooling for spatial coordinate regression, as it destroys translation equivariance.
+   - **Architecture**: Use a single-anchor CenterNet approach:
+     - Predict 1 center heatmap locating the object's core.
+     - Predict 8 sub-pixel `(dx, dy)` spatial offsets targeting the 4 visual corners from that center grid cell.
+     - **Do NOT add an orientation head to the coarse model.** A single center-pixel feature vector cannot generalize card orientation semantics (text direction, face side). Use `atan2` angle-sort to produce geometrically consistent corner ordering instead.
+   - Extract the `argmax` from the center heatmap, gather the offsets at that exact point, compute the 4 visual corners, and sort by `atan2(dy, dx)` ascending.
 
-2. **Rectification**
+2. **Stage 2.5 – Orientation classification (OrientNet, optional)**
+   - Run ONLY after the coarse model has localized the card.
+   - Warp the card to a 128×128 canonical square using the coarse homography.
+   - Feed the crop into a tiny (~50k param) MobileNet-style classifier predicting rotation: 0°, 90°, 180°, or 270°.
+   - Cyclically shift the coarse corners so `corners[0]` is the physical TL.
+   - **When to add this stage**: Only when physical corner identity (not just geometric consistency) is required downstream (e.g., crop face vs. barcode side). If only precise localization is needed, skip it.
+   - Training: Use GT homography to warp training images to canonical form. Apply colour jitter. Train with `CrossEntropyLoss(label_smoothing=0.05)` for 25–30 epochs with `AdamW + CosineAnnealingLR`.
+   - Export: TorchScript trace at 128×128 input.
+
+3. **Rectification**
    - Compute a homography from the coarse quadrilateral to a canonical upright card plane.
    - Warp the image into a fixed canonical resolution.
-   - Normalize rotation, skew, scale, padding, and portrait/landscape variation here.
 
 3. **Corner refinement**
    - Extract 4 fixed-location corner patches from the rectified card.
@@ -54,7 +65,7 @@ Dataset rules:
 - Validation may use the COCO-format `val.json`.
 - Each image contains exactly one card.
 - All 4 keypoints are always present.
-- Keypoint order is fixed and must remain consistent everywhere:
+- Keypoint order is fixed in physical space and not image space and must remain consistent everywhere:
   - `top-left`
   - `top-right`
   - `bottom-right`
@@ -70,6 +81,7 @@ Keep module interfaces simple and stable.
 
 Preferred modules:
 - `CoarseQuadNet`
+- `OrientNet`
 - `PatchRefiner`
 - `geometry`
 - `transforms`

@@ -16,6 +16,8 @@ class TrainingTracker:
         self.val_time = 0.0
         self.train_losses: List[float] = []
         self.val_losses: List[float] = []
+        self.train_components: Dict[str, List[float]] = {}
+        self.val_components: Dict[str, List[float]] = {}
         self.train_batch_times: List[float] = []
         self.val_batch_times: List[float] = []
 
@@ -23,6 +25,8 @@ class TrainingTracker:
         self.epoch_start = time.time()
         self.train_losses = []
         self.val_losses = []
+        self.train_components = {}
+        self.val_components = {}
         self.train_batch_times = []
         self.val_batch_times = []
 
@@ -38,13 +42,24 @@ class TrainingTracker:
     def end_val_phase(self) -> None:
         self.val_time = time.time() - self.val_start
 
-    def record_batch(self, phase: str, loss: float, batch_time: float) -> None:
+    def record_batch(self, phase: str, loss: float, batch_time: float, 
+                     components: Optional[Dict[str, float]] = None) -> None:
         if phase == 'train':
             self.train_losses.append(loss)
             self.train_batch_times.append(batch_time)
+            if components:
+                for k, v in components.items():
+                    if k not in self.train_components:
+                        self.train_components[k] = []
+                    self.train_components[k].append(float(v))
         else:
             self.val_losses.append(loss)
             self.val_batch_times.append(batch_time)
+            if components:
+                for k, v in components.items():
+                    if k not in self.val_components:
+                        self.val_components[k] = []
+                    self.val_components[k].append(float(v))
 
     def log_epoch_summary(self, epoch: int, max_epochs: int, lr: float, 
                           metrics: Dict[str, Any], recall: Optional[Dict[str, Any]] = None) -> None:
@@ -60,6 +75,21 @@ class TrainingTracker:
         self.logger.info(f"Time: Total: {total_time:.1f}s | Train: {self.train_time:.1f}s | Val: {self.val_time:.1f}s")
         self.logger.info(f"Batch Avg: Train: {avg_train_batch:.3f}s | Val: {avg_val_batch:.3f}s")
         self.logger.info(f"Loss: Train: {avg_train_loss:.5f} | Val: {avg_val_loss:.5f} | LR: {lr:.6f}")
+        
+        # Loss Components (v7.0 boost)
+        if self.train_components:
+            self.logger.info("Loss Components (Avg Train):")
+            sorted_keys = sorted(self.train_components.keys())
+            for k in sorted_keys:
+                avg_val = np.mean(self.train_components[k])
+                self.logger.info(f"  {k:20s}: {avg_val:.5f}")
+        
+        if self.val_components:
+            self.logger.info("Loss Components (Avg Val):")
+            sorted_keys = sorted(self.val_components.keys())
+            for k in sorted_keys:
+                avg_val = np.mean(self.val_components[k])
+                self.logger.info(f"  {k:20s}: {avg_val:.5f}")
         
         # Accuracy Metrics
         if metrics:
