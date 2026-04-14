@@ -16,9 +16,8 @@ from coarse.datasets.yolo_keypoint_dataset import YOLOKeypointDataset, collate_f
 from coarse.datasets.coco_val_dataset import COCOValDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
-from common.metrics import (DiceLoss, HeatmapFocalLoss, 
-                            calculate_accuracy_metrics, compute_patch_recall, 
-                            BoundingBoxCornerL1Loss)
+from common.metrics import (calculate_accuracy_metrics, compute_patch_recall,
+                            YOLOPoseLoss)
 from common.geometry import sort_corners_clockwise
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.logging_utils import TrainingTracker, TopLossTracker, HardExampleMiner
@@ -62,9 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pin_memory', action='store_true', default=True, help="Use pinned memory for faster GPU transfer.")
     parser.add_argument('--grad_clip', type=float, default=1.0, help="Gradient clipping value (0 to disable).")
     
-    # Simplified Loss Weights (v8.0)
-    parser.add_argument('--w_offset', type=float, default=10.0, help="Dense Sub-grid Offset L1 Loss.")
-    parser.add_argument('--w_heatmap', type=float, default=1.0, help="Dense Heatmap supervision (Focal Loss).")
+    # YOLO-Pose Loss Weights
+    parser.add_argument('--w_obj', type=float, default=1.0, help='Objectness (focal) loss weight.')
+    parser.add_argument('--w_box', type=float, default=5.0, help='CIoU bounding-box loss weight.')
+    parser.add_argument('--w_kpt', type=float, default=10.0, help='Keypoint regression loss weight.')
 
     # Mining
     parser.add_argument('--mine_hard', action='store_true', default=True, help="Enable hard example mining.")
@@ -89,7 +89,7 @@ def main() -> None:
 
     logger = setup_logging(os.path.join(run_dir, 'logs', 'train.log'))
     logger.info(f"Run directory: {run_dir}")
-    logger.info(f"Stage 1 Redesign Losses: Heatmap={args.w_heatmap}, DenseCoord={args.w_offset}")
+    logger.info(f"YOLO-Pose Losses: Obj={args.w_obj}, Box={args.w_box}, Kpt={args.w_kpt}")
     
     tracker = TrainingTracker(logger)
     set_seed(42)
@@ -114,14 +114,13 @@ def main() -> None:
 
     model = CoarseQuadNet().to(device)
     param_count = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model: Dense-Primary CoarseQuadNet | Parameters: {param_count:,}")
+    logger.info(f"Model: YOLO-Pose CoarseQuadNet | Parameters: {param_count:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Loss Functions (v8.0)
-    heatmap_criterion = HeatmapFocalLoss(alpha=2.0, beta=4.0)
-    geom_criterion = BoundingBoxCornerL1Loss()
+    # YOLO-Pose unified loss (objectness + CIoU box + keypoint)
+    criterion = YOLOPoseLoss(w_obj=args.w_obj, w_box=args.w_box, w_kpt=args.w_kpt)
 
     start_epoch = 0
     best_mean_error = float('inf')
@@ -165,30 +164,22 @@ def main() -> None:
             gt_corners = batch['corners']
             
             # --- Dynamic Corner Sorting (Physical to Visual) ---
-            # CNN heatmaps/offsets are explicitly trained on 'visual' spatial geometry.
             gt_corners_visual = sort_corners_clockwise(gt_corners)
             
-            # Compute Exact Centroid [B, 1, 2]
-            gt_centers = gt_corners_visual.mean(dim=1, keepdim=True)
-            
-            # 1. Primary Dense Spatial Supervision
-            loss_geom = geom_criterion(out['dense_geom'], gt_centers, gt_corners_visual)
-            loss_heatmap = heatmap_criterion(out['dense_center'], gt_centers)
-            
-            total_loss = (loss_geom * args.w_offset + 
-                          loss_heatmap * args.w_heatmap)
+            # YOLO-Pose unified loss
+            losses = criterion(out['raw_pred'], gt_corners_visual)
+            total_loss = losses['total']
             
             total_loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            # Detailed component logging (v8.1)
+            # Detailed component logging
             components = {
-                'geom_raw': loss_geom.item(),
-                'geom_w': (loss_geom * args.w_offset).item(),
-                'heatmap_raw': loss_heatmap.item(),
-                'heatmap_w': (loss_heatmap * args.w_heatmap).item(),
+                'obj': losses['obj'].item(),
+                'box': losses['box'].item(),
+                'kpt': losses['kpt'].item(),
             }
             tracker.record_batch('train', total_loss.item(), sync_time() - batch_start, components=components)
             train_pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
@@ -225,8 +216,7 @@ def main() -> None:
                     weights.append(w)
                 miner.update(batch['index'].tolist(), weights)
 
-            del out, batch, total_loss, components
-            del loss_geom, loss_heatmap
+            del out, batch, total_loss, components, losses
 
         tracker.end_train_phase()
         torch.cuda.empty_cache()
@@ -246,20 +236,15 @@ def main() -> None:
                 
                 # --- Dynamic Corner Sorting (Physical to Visual) ---
                 gt_corners_visual = sort_corners_clockwise(gt_corners)
-                gt_centers = gt_corners_visual.mean(dim=1, keepdim=True)
                 
-                # Val Loss tracking
-                loss_geom = geom_criterion(out['dense_geom'], gt_centers, gt_corners_visual)
-                loss_heatmap = heatmap_criterion(out['dense_center'], gt_centers)
-                
-                val_total_loss = (loss_geom * args.w_offset + 
-                                  loss_heatmap * args.w_heatmap)
+                # YOLO-Pose unified loss
+                losses = criterion(out['raw_pred'], gt_corners_visual)
+                val_total_loss = losses['total']
                 
                 components = {
-                    'geom_raw': loss_geom.item(),
-                    'geom_w': (loss_geom * args.w_offset).item(),
-                    'heatmap_raw': loss_heatmap.item(),
-                    'heatmap_w': (loss_heatmap * args.w_heatmap).item(),
+                    'obj': losses['obj'].item(),
+                    'box': losses['box'].item(),
+                    'kpt': losses['kpt'].item(),
                 }
                 tracker.record_batch('val', val_total_loss.item(), sync_time() - batch_start, components=components)
 
@@ -296,8 +281,7 @@ def main() -> None:
                     })
                 
                 # Explicitly free variables
-                del out, batch, components
-                del loss_geom, loss_heatmap
+                del out, batch, components, losses
 
         tracker.end_val_phase()
         torch.cuda.empty_cache()

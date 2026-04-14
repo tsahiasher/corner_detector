@@ -115,51 +115,147 @@ class WingLoss(nn.Module):
         return loss.mean()
 
 
-class BoundingBoxCornerL1Loss(nn.Module):
-    """L1 Loss for the 10 spatial geometry channels (width, height, 8 quad offsets) supervised ONLY at the true GT center."""
-    def forward(self, pred_geom: torch.Tensor, gt_centers: torch.Tensor, gt_corners: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = pred_geom.shape
-        device = pred_geom.device
-        
-        # True center integer locations
-        center_grid_x = gt_centers[:, 0, 0] * W
-        center_grid_y = gt_centers[:, 0, 1] * H
-        
-        idx_x = torch.clamp(torch.floor(center_grid_x).long(), 0, W - 1)
-        idx_y = torch.clamp(torch.floor(center_grid_y).long(), 0, H - 1)
-        
-        # Gather predictions at center location
-        b_idx = torch.arange(B, device=device)
-        pred_raw = pred_geom[b_idx, :, idx_y, idx_x] # [B, 10]
-        
-        w_pred = torch.sigmoid(pred_raw[:, 0])
-        h_pred = torch.sigmoid(pred_raw[:, 1])
-        quad_pred = torch.tanh(pred_raw[:, 2:10]) * 0.2
-        
-        # Real mapped center in [0, 1] based on the grid index
-        cx = (idx_x.float() / W)
-        cy = (idx_y.float() / H)
-        
-        # Reconstruct Bounding Box Corner anchors ([TL_x, TL_y, TR_x, TR_y, BR_x, BR_y, BL_x, BL_y])
-        box_tl_x = cx - w_pred / 2.0
-        box_tl_y = cy - h_pred / 2.0
-        box_tr_x = cx + w_pred / 2.0
-        box_tr_y = cy - h_pred / 2.0
-        box_br_x = cx + w_pred / 2.0
-        box_br_y = cy + h_pred / 2.0
-        box_bl_x = cx - w_pred / 2.0
-        box_bl_y = cy + h_pred / 2.0
-        
-        base_box = torch.stack([
-            box_tl_x, box_tl_y, box_tr_x, box_tr_y, 
-            box_br_x, box_br_y, box_bl_x, box_bl_y
-        ], dim=-1) # [B, 8]
-        
-        # Final Corners = Base Box + Quad Refinements
-        pred_corners_flat = base_box + quad_pred
-        gt_corners_flat = gt_corners.view(B, 8)
-        
-        return F.l1_loss(pred_corners_flat, gt_corners_flat, reduction='mean')
+class YOLOPoseLoss(nn.Module):
+    """Combined YOLO-Pose loss for single-object keypoint detection.
+
+    Computes three loss terms, all supervised at the ground-truth centre cell:
+
+    1. **Objectness** – CenterNet focal loss on a Gaussian heatmap target.
+    2. **Bounding box** – Complete-IoU (CIoU) loss on axis-aligned bbox.
+    3. **Keypoints** – Smooth-L1 on absolute normalised corner positions.
+
+    Args:
+        w_obj:  Weight for objectness focal loss.
+        w_box:  Weight for CIoU bounding-box loss.
+        w_kpt:  Weight for keypoint regression loss.
+        sigma:  Gaussian spread for the objectness heatmap target.
+    """
+
+    def __init__(self, w_obj: float = 1.0, w_box: float = 5.0,
+                 w_kpt: float = 10.0, sigma: float = 2.0) -> None:
+        super().__init__()
+        self.w_obj = w_obj
+        self.w_box = w_box
+        self.w_kpt = w_kpt
+        self.obj_loss_fn = HeatmapFocalLoss(sigma=sigma)
+
+    @staticmethod
+    def _ciou(pcx: torch.Tensor, pcy: torch.Tensor,
+              pw: torch.Tensor, ph: torch.Tensor,
+              gcx: torch.Tensor, gcy: torch.Tensor,
+              gw: torch.Tensor, gh: torch.Tensor) -> torch.Tensor:
+        """Complete-IoU loss between predicted and GT boxes (normalised coords).
+
+        Args:
+            pcx, pcy, pw, ph: Predicted centre-x, centre-y, width, height.
+            gcx, gcy, gw, gh: Ground-truth centre-x, centre-y, width, height.
+
+        Returns:
+            Scalar CIoU loss (1 − CIoU), averaged over batch.
+        """
+        eps = 1e-7
+
+        # Convert to xyxy
+        px1, py1 = pcx - pw / 2, pcy - ph / 2
+        px2, py2 = pcx + pw / 2, pcy + ph / 2
+        gx1, gy1 = gcx - gw / 2, gcy - gh / 2
+        gx2, gy2 = gcx + gw / 2, gcy + gh / 2
+
+        # Intersection
+        ix1 = torch.max(px1, gx1)
+        iy1 = torch.max(py1, gy1)
+        ix2 = torch.min(px2, gx2)
+        iy2 = torch.min(py2, gy2)
+        inter = torch.clamp(ix2 - ix1, min=0) * torch.clamp(iy2 - iy1, min=0)
+
+        # Union
+        union = pw * ph + gw * gh - inter + eps
+        iou = inter / union
+
+        # Smallest enclosing box diagonal²
+        ex1 = torch.min(px1, gx1)
+        ey1 = torch.min(py1, gy1)
+        ex2 = torch.max(px2, gx2)
+        ey2 = torch.max(py2, gy2)
+        c_sq = (ex2 - ex1) ** 2 + (ey2 - ey1) ** 2 + eps
+
+        # Centre distance²
+        rho_sq = (pcx - gcx) ** 2 + (pcy - gcy) ** 2
+
+        # Aspect-ratio consistency penalty
+        v = (4.0 / (math.pi ** 2)) * (
+            torch.atan(gw / (gh + eps)) - torch.atan(pw / (ph + eps))
+        ) ** 2
+        with torch.no_grad():
+            alpha = v / ((1.0 - iou) + v + eps)
+
+        ciou = iou - rho_sq / c_sq - alpha * v
+        return (1.0 - ciou).mean()
+
+    def forward(self, raw_pred: torch.Tensor,
+                gt_corners: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute the combined YOLO-Pose loss.
+
+        Args:
+            raw_pred:   Raw model grid output ``[B, 13, Hg, Wg]``.
+            gt_corners: Ground-truth corner keypoints ``[B, 4, 2]``,
+                        normalised to ``[0, 1]``.
+
+        Returns:
+            Dict with scalar tensors: ``total``, ``obj``, ``box``, ``kpt``.
+        """
+        B, _, Hg, Wg = raw_pred.shape
+        device = raw_pred.device
+
+        # ---- Ground-truth derived quantities ----
+        gt_ctr = gt_corners.mean(dim=1, keepdim=True)  # [B, 1, 2]
+
+        gx_min = gt_corners[:, :, 0].min(1).values
+        gy_min = gt_corners[:, :, 1].min(1).values
+        gx_max = gt_corners[:, :, 0].max(1).values
+        gy_max = gt_corners[:, :, 1].max(1).values
+        gcx = (gx_min + gx_max) / 2
+        gcy = (gy_min + gy_max) / 2
+        gw = (gx_max - gx_min).clamp(min=1e-6)
+        gh = (gy_max - gy_min).clamp(min=1e-6)
+
+        # Positive cell indices
+        gj = torch.clamp((gt_ctr[:, 0, 0] * Wg).long(), 0, Wg - 1)
+        gi = torch.clamp((gt_ctr[:, 0, 1] * Hg).long(), 0, Hg - 1)
+        bi = torch.arange(B, device=device)
+
+        # ---- 1. Objectness (Focal Heatmap) ----
+        loss_obj = self.obj_loss_fn(raw_pred[:, 0:1], gt_ctr)
+
+        # ---- 2. Bounding-box CIoU (at GT cell) ----
+        tx = raw_pred[bi, 1, gi, gj]
+        ty = raw_pred[bi, 2, gi, gj]
+        tw = raw_pred[bi, 3, gi, gj]
+        th = raw_pred[bi, 4, gi, gj]
+
+        pcx = (torch.sigmoid(tx) + gj.float()) / Wg
+        pcy = (torch.sigmoid(ty) + gi.float()) / Hg
+        pw = torch.sigmoid(tw)
+        ph = torch.sigmoid(th)
+
+        loss_box = self._ciou(pcx, pcy, pw, ph, gcx, gcy, gw, gh)
+
+        # ---- 3. Keypoint Smooth-L1 (at GT cell) ----
+        kpt_raw = raw_pred[bi, 5:13, gi, gj]   # [B, 8]
+        pred_kpt = torch.sigmoid(kpt_raw).view(B, 4, 2)
+        loss_kpt = F.smooth_l1_loss(pred_kpt, gt_corners)
+
+        # ---- Total ----
+        total = (loss_obj * self.w_obj
+                 + loss_box * self.w_box
+                 + loss_kpt * self.w_kpt)
+
+        return {
+            'total': total,
+            'obj':   loss_obj,
+            'box':   loss_box,
+            'kpt':   loss_kpt,
+        }
 
 
 class SoftArgmax2D(nn.Module):
