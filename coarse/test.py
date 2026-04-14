@@ -18,7 +18,8 @@ from common.checkpoint import load_checkpoint
 from common.seed import set_seed
 from common.metrics import calculate_accuracy_metrics, compute_patch_recall
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
-from common.visualization import draw_quadrilateral, save_diagnostic_visualization
+from common.geometry import sort_corners_clockwise
+from common.visualization import save_diagnostic_visualization
 
 
 def setup_logging(log_file: str) -> logging.Logger:
@@ -43,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--weights', type=str, required=True, help="Path to checkpoint (.pt) or TorchScript.")
     parser.add_argument('--val_images', type=str, default='../crop-dataset-eitan-yolo/images/val', help="Val images dir.")
     parser.add_argument('--val_json', type=str, default='../crop-dataset-eitan-yolo/annotations/val.json', help="Val COCO JSON.")
-    parser.add_argument('--image_size', type=int, default=384, help="Input size.")
+    parser.add_argument('--min_size', type=int, default=800, help="Minimum image dimension for resizing.")
+    parser.add_argument('--max_size', type=int, default=1333, help="Maximum image dimension for resizing.")
     parser.add_argument('--batch_size', type=int, default=1, help="Batch size for eval.")
     add_device_args(parser, default='auto')
     parser.add_argument('--save_csv', action='store_true', default=True, help="Save per-image results.")
@@ -111,7 +113,7 @@ def main() -> None:
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
 
-    val_dataset = COCOValDataset(args.val_images, args.val_json, image_size=args.image_size)
+    val_dataset = COCOValDataset(args.val_images, args.val_json, min_size=args.min_size, max_size=args.max_size)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
     # Load Model
@@ -131,16 +133,26 @@ def main() -> None:
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
             batch = move_batch_to_device(batch, device)
-            out = model(batch['image'])
-            gt_corners = batch['corners']
+            # --- Dynamic Corner Sorting (Semantic Alignment) ---
+            gt_corners_visual = sort_corners_clockwise(gt_corners)
             
             # Use structured corners for precision metrics
             pred = out['corners']
 
             # Compute pixel errors
-            diff = (pred - gt_corners).abs()
-            diff[:, :, 0] *= batch['orig_width'].view(-1, 1)
-            diff[:, :, 1] *= batch['orig_height'].view(-1, 1)
+            # MUST use the same resolution-aware scaling as training
+            B_idx_temp = pred.size(0)
+            pad_h = torch.tensor(batch['image'].shape[2], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
+            pad_w = torch.tensor(batch['image'].shape[3], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
+
+            orig_w = batch.get('orig_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+            orig_h = batch.get('orig_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+            
+            # In test mode, we assume the model output is relative to the padded [pad_h, pad_w]
+            # Since pred is normalized [0, 1] relative to the network input (padded)
+            diff = (pred - gt_corners_visual).abs()
+            diff[:, :, 0] *= orig_w
+            diff[:, :, 1] *= orig_h
             dist = torch.norm(diff, dim=-1) # [B, 4]
             all_errors_px.append(dist.cpu())
             for b in range(batch['image'].size(0)):
@@ -153,7 +165,7 @@ def main() -> None:
 
             if args.save_vis and len(results) <= args.max_vis:
                 save_diagnostic_visualization(
-                    batch['image'][0], pred[0], gt_corners[0],
+                    batch['image'][0], pred[0], gt_corners_visual[0],
                     out['mask'][0], out['edges'][0],
                     batch['img_path'][0], os.path.join(run_dir, 'visualizations')
                 )

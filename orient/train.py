@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from orient.models.orient_net import OrientNet
-from orient.datasets.orient_dataset import OrientDataset
+from orient.datasets.orient_dataset import OrientDataset, collate_fn_pad
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
@@ -55,8 +55,10 @@ def parse_args() -> argparse.Namespace:
                         help='Training batch size.')
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Initial learning rate.')
-    parser.add_argument('--crop_size', type=int, default=128,
-                        help='Canonical card crop size fed to OrientNet.')
+    parser.add_argument('--min_size', type=int, default=800,
+                        help='Minimum image dimension.')
+    parser.add_argument('--max_size', type=int, default=1333,
+                        help='Maximum image dimension.')
     parser.add_argument('--runs_dir', type=str, default='./orient/runs',
                         help='Base directory for training runs.')
     parser.add_argument('--name', type=str, default='',
@@ -94,15 +96,19 @@ def main() -> None:
     set_seed(42)
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
+    
+    if os.name == 'nt' and device.type == 'cpu' and args.num_workers > 0:
+        logger.warning("Windows CPU detected: setting num_workers=0 to prevent shared file mapping error <1455>.")
+        args.num_workers = 0
 
     logger.info('Initializing datasets...')
-    train_dataset = OrientDataset(args.train_images, crop_size=args.crop_size, is_train=True)
-    val_dataset   = OrientDataset(args.val_images,   crop_size=args.crop_size, is_train=False)
+    train_dataset = OrientDataset(args.train_images, min_size=args.min_size, max_size=args.max_size, is_train=True)
+    val_dataset   = OrientDataset(args.val_images,   min_size=args.min_size, max_size=args.max_size, is_train=False)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              shuffle=True, num_workers=args.num_workers, pin_memory=True)
+                              shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn_pad)
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
+                              shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn_pad)
 
     model = OrientNet(num_classes=4).to(device)
     param_count = sum(p.numel() for p in model.parameters())

@@ -1,21 +1,23 @@
 import os
-import cv2
 import torch
 import numpy as np
 from torch.utils.data import Dataset
-from torchvision import transforms
+from PIL import Image, UnidentifiedImageError
 from common.yolo_labels import parse_yolo_keypoint_line
+from common.transforms import get_train_transforms
 
 class RefineKeypointDataset(Dataset):
     """
     Stage 2 Dataset: Extracts high-res patches around coarse corner estimates.
     Simulates Stage 1 errors using random jitter to train the refiner for robustness.
     """
-    def __init__(self, image_dir, is_train=True, jitter_px=15.0, patch_size=96):
+    def __init__(self, image_dir, is_train=True, jitter_px=15.0, patch_size=96, min_size=800, max_size=1333):
         self.image_dir = image_dir
         self.is_train = is_train
         self.jitter_px = jitter_px
         self.patch_size = patch_size
+        self.min_size = min_size
+        self.max_size = max_size
         
         # Load image paths and labels (reusing YOLO parsing from Stage 1)
         self.img_paths = []
@@ -45,10 +47,8 @@ class RefineKeypointDataset(Dataset):
         self.img_paths = [self.img_paths[i] for i in valid_indices]
         self.labels = [self.labels[i] for i in valid_indices]
 
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        # Use the standard global transforms for spatial resize and normalization
+        self.transforms = get_train_transforms(image_size=None, min_size=self.min_size, max_size=self.max_size, is_train=False)
 
     def __len__(self):
         return len(self.img_paths)
@@ -57,13 +57,14 @@ class RefineKeypointDataset(Dataset):
         img_path = self.img_paths[idx]
         gt_corners_norm = self.labels[idx] # [4, 2]
 
-        # Use OpenCV for high-res cropping (faster than PIL for specific regions)
-        img = cv2.imread(img_path)
-        if img is None:
-            # Fallback or error
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except (UnidentifiedImageError, OSError):
             return self.__getitem__((idx + 1) % len(self))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        H, W = img.shape[:2]
+            
+        # Transform scales image to [800, 1333] bound natively and outputs Normalised [0,1] Tensor
+        img_t, _ = self.transforms(image, gt_corners_norm)
+        C, H, W = img_t.shape
 
         patches = []
         targets = []
@@ -100,23 +101,28 @@ class RefineKeypointDataset(Dataset):
             
             # Pad if out of bounds (Refinement needs consistent patch size)
             if x1 < 0 or y1 < 0 or x2 > W or y2 > H:
-                patch = np.zeros((self.patch_size, self.patch_size, 3), dtype=np.uint8)
+                patch = torch.zeros((3, self.patch_size, self.patch_size), dtype=torch.float32)
+                # Normalize padding bounds
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                patch = (patch - mean) / std # Fill padded territory with 0-value image mean!
+                
                 # Calculate valid intersection
                 sx1, sy1 = max(0, x1), max(0, y1)
                 sx2, sy2 = min(W, x2), min(H, y2)
                 dx1, dy1 = max(0, -x1), max(0, -y1)
                 dx2, dy2 = dx1 + (sx2 - sx1), dy1 + (sy2 - sy1)
                 if sx2 > sx1 and sy2 > sy1:
-                    patch[dy1:dy2, dx1:dx2] = img[sy1:sy2, sx1:sx2]
+                    patch[:, dy1:dy2, dx1:dx2] = img_t[:, sy1:sy2, sx1:sx2]
             else:
-                patch = img[y1:y2, x1:x2]
+                patch = img_t[:, y1:y2, x1:x2].clone()
             
             # Target position inside the patch [0, 1]
             # Center of the patch is at (0.5, 0.5) in this space if jitter is 0.
             ox = (tx - x1) / self.patch_size
             oy = (ty - y1) / self.patch_size
             
-            patches.append(self.transform(patch))
+            patches.append(patch)
             targets.append(torch.tensor([ox, oy], dtype=torch.float32))
 
         return {

@@ -17,12 +17,16 @@ class COCOValDataset(Dataset):
     Args:
         images_dir (str): Directory containing validation images.
         annotation_file (str): Path to the COCO format validation JSON file.
-        image_size (int, optional): Target size to resize images to. Defaults to 384.
+        image_size (int, optional): Target static size to resize images to. Defaults to None.
+        min_size (int, optional): Minimum edge for dynamic resize. Defaults to 800.
+        max_size (int, optional): Maximum edge for dynamic resize. Defaults to 1333.
     """
-    def __init__(self, images_dir: str, annotation_file: str, image_size: int = 384) -> None:
+    def __init__(self, images_dir: str, annotation_file: str, image_size: int = None, min_size: int = 800, max_size: int = 1333) -> None:
         self.images_dir = images_dir
         self.image_size = image_size
-        self.transforms = get_train_transforms(image_size, is_train=False)
+        self.min_size = min_size
+        self.max_size = max_size
+        self.transforms = get_train_transforms(image_size=image_size, min_size=min_size, max_size=max_size, is_train=False)
         
         try:
             with open(annotation_file, 'r', encoding='utf-8') as f:

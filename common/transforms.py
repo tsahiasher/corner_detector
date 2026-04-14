@@ -81,17 +81,51 @@ class Normalize:
 
 
 
-def get_train_transforms(image_size: int, is_train: bool = True) -> Compose:
+class ResizeMinMax:
+    """Resizes image keeping aspect ratio, ensuring min side is min_size and max side <= max_size."""
+    def __init__(self, min_size: int = 800, max_size: int = 1333) -> None:
+        self.min_size = min_size
+        self.max_size = max_size
+        
+    def __call__(self, img: Image.Image, keypoints: List[List[float]]) -> Tuple[Image.Image, List[List[float]]]:
+        w, h = img.size
+        min_original_size = float(min((w, h)))
+        max_original_size = float(max((w, h)))
+        if min_original_size == 0.0:
+            return img, keypoints
+            
+        scale = self.min_size / min_original_size
+        if max_original_size * scale > self.max_size:
+            scale = self.max_size / max_original_size
+            
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+        # ensure it's a multiple of 32 for the CNN backbone if this is ever used directly
+        # new_w = (new_w // 32) * 32
+        # new_h = (new_h // 32) * 32
+        
+        img = TF.resize(img, [new_h, new_w])
+        # Normalized keypoints remain perfectly unchanged because the aspect ratio for the whole image changed proportionally!
+        return img, keypoints
+
+def get_train_transforms(image_size: int = None, min_size: int = None, max_size: int = None, is_train: bool = True) -> Compose:
     """Gets the transformation pipeline.
 
     Args:
-        image_size (int): Target square dimension.
+        image_size (int, optional): Target square dimension.
+        min_size (int, optional): Minimum side dimension.
+        max_size (int, optional): Maximum side dimension.
         is_train (bool, optional): Whether this is for training (enables augmentations). Defaults to True.
 
     Returns:
         Compose: The composition of transforms.
     """
-    transforms = [ResizeImage(image_size)]
+    if min_size is not None and max_size is not None:
+        transforms = [ResizeMinMax(min_size, max_size)]
+    elif image_size is not None:
+        transforms = [ResizeImage(image_size)]
+    else:
+        raise ValueError("Must provide either image_size, or both min_size and max_size.")
 
     transforms.extend([ToTensor(), Normalize()])
     return Compose(transforms)

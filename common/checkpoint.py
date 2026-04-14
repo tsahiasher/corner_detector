@@ -49,7 +49,7 @@ def load_checkpoint(model: torch.nn.Module, optimizer: Optional[torch.optim.Opti
     map_loc = device if device is not None else 'cpu'
     if os.path.exists(path):
         try:
-            checkpoint = torch.load(path, map_location=map_loc)
+            checkpoint = torch.load(path, map_location=map_loc, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             if optimizer is not None and 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

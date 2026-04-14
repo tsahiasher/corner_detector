@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict
 import math
-from typing import Tuple, Optional, Dict
+import torchvision.models as models
+from common.geometry import sort_corners_clockwise
 
 class ConvBNReLU(nn.Module):
     """Standard Convolution + BatchNorm + ReLU6 block."""
@@ -18,6 +19,13 @@ class ConvBNReLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.relu(self.bn(self.conv(x)))
 
+class AddCoords(nn.Module):
+    """CoordConv equivalent: Appends 2 normalized spatial coordinate channels (-1 to 1) to the input tensor."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        yy_channel = torch.linspace(-1, 1, steps=h, device=x.device, dtype=x.dtype).view(1, 1, h, 1).expand(b, 1, h, w)
+        xx_channel = torch.linspace(-1, 1, steps=w, device=x.device, dtype=x.dtype).view(1, 1, 1, w).expand(b, 1, h, w)
+        return torch.cat([x, yy_channel, xx_channel], dim=1)
 
 class DepthwiseSeparableConv(nn.Module):
     """Depthwise Separable Convolution block."""
@@ -35,85 +43,68 @@ class DepthwiseSeparableConv(nn.Module):
 class CoarseQuadNet(nn.Module):
     """Refined Coarse Quadrilateral Network for ID Card Detection.
 
-    Stage 1 Redesign (v7.0):
-    1.  **Stronger Dense Path**: Improved FPN Neck at 96x96 resolution.
-    2.  **Dense Keypoint Head**: Predicts 4 Heatmaps + 8 Offset channels (dx, dy).
-    3.  **Primary Dense Inference**: Corners are derived from Heatmap + Offset peaks.
-    4.  **Auxiliary Quad Branch**: Structured global quad regressor for stable anchoring.
+    Stage 1 Redesign (v8.0 ResNet18):
+    1.  **Stronger Dense Path**: ResNet18 Backbone with FPN Neck targeting 1/4 resolution.
+    2.  **Dense Keypoint Head**: Predicts 1 Heatmap + 8 Offset channels (dx, dy).
     """
     def __init__(self) -> None:
         super().__init__()
 
-        # Backbone: Input 384x384 -> 12x12
-        self.stem = ConvBNReLU(3, 16, stride=2)                       # 192
-        
-        # Split stage1 to get 96x96 features
-        self.stage1_feat = DepthwiseSeparableConv(16, 32, stride=2)    # 96
-        
-        self.stage1_down = nn.Sequential(
-            DepthwiseSeparableConv(32, 64, stride=2),                  # 48
-            DepthwiseSeparableConv(64, 64, stride=1),                  # 48
-        )
+        # Backbone: ResNet18
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        # STEM: Input -> 1/4 resolution
+        self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1 = resnet.layer1 # 1/4, 64 ch
+        self.layer2 = resnet.layer2 # 1/8, 128 ch
+        self.layer3 = resnet.layer3 # 1/16, 256 ch
+        self.layer4 = resnet.layer4 # 1/32, 512 ch
 
-        self.stage2 = nn.Sequential(
-            DepthwiseSeparableConv(64, 128, stride=2),                 # 24
-            DepthwiseSeparableConv(128, 128, stride=1),                # 24
-        )
-
-        self.stage3 = nn.Sequential(
-            DepthwiseSeparableConv(128, 256, stride=2),                # 12
-            DepthwiseSeparableConv(256, 256, stride=1),                # 12
-            DepthwiseSeparableConv(256, 512, stride=1),                # 12
-        )
-
-        # Better FPN Neck for 96x96 Dense Path
-        self.lat_96 = nn.Conv2d(32, 64, kernel_size=1)
-        self.lat_48 = nn.Conv2d(64, 64, kernel_size=1)
-        self.lat_24 = nn.Conv2d(128, 64, kernel_size=1)
-        self.lat_12 = nn.Conv2d(512, 64, kernel_size=1)
+        # Better FPN Neck for Dense Path targeting 1/4 resolution
+        self.lat_32 = nn.Conv2d(512, 128, kernel_size=1)
+        self.lat_16 = nn.Conv2d(256, 128, kernel_size=1)
+        self.lat_8  = nn.Conv2d(128, 128, kernel_size=1)
+        self.lat_4  = nn.Conv2d(64, 128, kernel_size=1)
         
-        # Exponential Dilated Refinement with Dropout for generalization:
-        # Receptive field mathematically expands to 63x63 without adding ANY new parameters.
-        # Dropout(0.1) prevents the heatmap from overfitting training images.
+        self.smooth_4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+
+        self.add_coords = AddCoords()
+
+        # Exponential Dilated Refinement (Input is now 128 + 2 coordinate channels)
         self.dense_refine = nn.Sequential(
-            DepthwiseSeparableConv(64, 64, stride=1, dilation=1),
-            nn.Dropout2d(0.1),
-            DepthwiseSeparableConv(64, 64, stride=1, dilation=2),
-            nn.Dropout2d(0.1),
-            DepthwiseSeparableConv(64, 64, stride=1, dilation=4), 
-            nn.Dropout2d(0.1),
-            DepthwiseSeparableConv(64, 64, stride=1, dilation=8), 
-            nn.Dropout2d(0.1),
-            DepthwiseSeparableConv(64, 64, stride=1, dilation=16), 
+            DepthwiseSeparableConv(130, 128, stride=1, dilation=1),
+            DepthwiseSeparableConv(128, 128, stride=1, dilation=2),
+            DepthwiseSeparableConv(128, 128, stride=1, dilation=4), 
+            DepthwiseSeparableConv(128, 128, stride=1, dilation=8), 
+            DepthwiseSeparableConv(128, 128, stride=1, dilation=16), 
         )
         
         # CenterNet Specific heads
-        self.center_heatmap_head = nn.Conv2d(64, 1, kernel_size=1)   # Single Card Center
-        self.corner_offset_head = nn.Conv2d(64, 8, kernel_size=1)    # 8 Sub-grid offsets (dx, dy) for 4 visual corners
-        # orient_head REMOVED: a single 4-channel center-pixel cannot generalize orientation semantics.
-        # Instead, inference applies the same deterministic angle-sort as training.
+        self.center_heatmap_head = nn.Conv2d(128, 1, kernel_size=1)   # Single Card Center
+        self.corner_geom_head = nn.Conv2d(128, 10, kernel_size=1)     # 2 for w/h, 8 for sub-quad offsets
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         B = x.size(0)
         
         # 1. Backbone
         f_stem = self.stem(x)
-        f_96 = self.stage1_feat(f_stem)
-        f_48 = self.stage1_down(f_96)
-        f_24 = self.stage2(f_48)
-        f_12 = self.stage3(f_24)
+        f_4 = self.layer1(f_stem)
+        f_8 = self.layer2(f_4)
+        f_16 = self.layer3(f_8)
+        f_32 = self.layer4(f_16)
 
         # 2. Dense Neck (FPN)
-        p12 = self.lat_12(f_12)
-        p24 = self.lat_24(f_24) + F.interpolate(p12, size=(24, 24), mode='bilinear', align_corners=False)
-        p48 = self.lat_48(f_48) + F.interpolate(p24, size=(48, 48), mode='bilinear', align_corners=False)
-        p96 = self.lat_96(f_96) + F.interpolate(p48, size=(96, 96), mode='bilinear', align_corners=False)
+        p32 = self.lat_32(f_32)
+        p16 = self.lat_16(f_16) + F.interpolate(p32, size=f_16.shape[2:], mode='bilinear', align_corners=False)
+        p8  = self.lat_8(f_8)   + F.interpolate(p16, size=f_8.shape[2:], mode='bilinear', align_corners=False)
+        p4  = self.lat_4(f_4)   + F.interpolate(p8, size=f_4.shape[2:], mode='bilinear', align_corners=False)
         
-        dense_feat = self.dense_refine(p96)
+        p4 = self.smooth_4(p4)
+        p4_coords = self.add_coords(p4)
+        dense_feat = self.dense_refine(p4_coords)
         
         # 3. Dense Branch Prediction
-        dense_center = self.center_heatmap_head(dense_feat) # [B, 1, 96, 96]
-        dense_offsets = self.corner_offset_head(dense_feat) # [B, 8, 96, 96]
+        dense_center = self.center_heatmap_head(dense_feat) # [B, 1, H/4, W/4]
+        dense_geom = self.corner_geom_head(dense_feat)      # [B, 10, 96, 96]
         
         # Center Peak Extraction (Argmax)
         H, W = dense_center.shape[2:]
@@ -123,39 +114,48 @@ class CoarseQuadNet(nn.Module):
         grid_y = max_idx // W
         grid_x = max_idx % W
         
-        # Gather 8 predicted offsets exactly at the single center peak location
+        # Gather predicted geometry exactly at the single center peak location
         b_idx_gather = torch.arange(B, device=x.device)
-        offsets_raw = dense_offsets[b_idx_gather, :, grid_y, grid_x]     # [B, 8]
         
-        # Bound offsets with Tanh to prevent off-screen explosions.
-        offsets = torch.tanh(offsets_raw) * 0.75
+        # Bounding Box Prior (Width, Height)
+        w_pred = torch.sigmoid(dense_geom[b_idx_gather, 0, grid_y, grid_x]) # [B]
+        h_pred = torch.sigmoid(dense_geom[b_idx_gather, 1, grid_y, grid_x]) # [B]
         
-        # Visual Corners = Center(norm) + Offsets(norm)
-        offsets_x = offsets[:, 0::2] # [B, 4]
-        offsets_y = offsets[:, 1::2] # [B, 4]
+        # Quad refinement offsets (Bounded by Tanh to stay within ~20% of image size)
+        quad_raw = dense_geom[b_idx_gather, 2:10, grid_y, grid_x]          # [B, 8]
+        quad_pred = torch.tanh(quad_raw) * 0.2                             # [B, 8]
         
-        pred_x = (grid_x.float().unsqueeze(1) / W) + offsets_x # [B, 4]
-        pred_y = (grid_y.float().unsqueeze(1) / H) + offsets_y # [B, 4]
+        cx = (grid_x.float() / W)
+        cy = (grid_y.float() / H)
         
-        # Hard clamp: corners must always be inside the image boundary
-        pred_x = torch.clamp(pred_x, 0.0, 1.0)
-        pred_y = torch.clamp(pred_y, 0.0, 1.0)
-        corners_visual = torch.stack([pred_x, pred_y], dim=-1) # [B, 4, 2]
+        # Reconstruct Bounding Box Corner anchors ([TL_x, TL_y, TR_x, TR_y, BR_x, BR_y, BL_x, BL_y])
+        box_tl_x = cx - w_pred / 2.0
+        box_tl_y = cy - h_pred / 2.0
+        box_tr_x = cx + w_pred / 2.0
+        box_tr_y = cy - h_pred / 2.0
+        box_br_x = cx + w_pred / 2.0
+        box_br_y = cy + h_pred / 2.0
+        box_bl_x = cx - w_pred / 2.0
+        box_bl_y = cy + h_pred / 2.0
+        
+        base_box = torch.stack([
+            box_tl_x, box_tl_y, box_tr_x, box_tr_y, 
+            box_br_x, box_br_y, box_bl_x, box_bl_y
+        ], dim=-1) # [B, 8]
+        
+        # Final Corners = Base Box + Quad Refinements
+        corners_visual_flat = base_box + quad_pred
+        
+        # Reshape to [B, 4, 2] and hard clamp
+        corners_visual = corners_visual_flat.view(B, 4, 2)
+        corners_visual = torch.clamp(corners_visual, 0.0, 1.0)
 
-        # Deterministic angle-sort for semantic ordering (replaces orient_head).
-        # This is the EXACT same sort applied to GT corners in training, guaranteeing consistency.
-        # Sort by atan2(dy, dx) ascending => clockwise from top-left visual corner.
-        centroid = corners_visual.mean(dim=1, keepdim=True)   # [B, 1, 2]
-        diffs = corners_visual - centroid                      # [B, 4, 2]
-        angles = torch.atan2(diffs[:, :, 1], diffs[:, :, 0]) # [B, 4]
-        sort_idx = torch.argsort(angles, dim=1)               # [B, 4]
-        b_idx_t = torch.arange(B, device=x.device).unsqueeze(1).expand(B, 4)
-        corners_final = corners_visual[b_idx_t, sort_idx]     # [B, 4, 2] semantically sorted
+        corners_final = sort_corners_clockwise(corners_visual)
 
         return {
             'score': torch.ones((B, 1), device=x.device),
             'corners': corners_final,           # Semantically sorted corners (angle-sorted)
-            'corners_visual': corners_visual,   # Raw predicted corners in offset order
-            'dense_center': dense_center,       # [B, 1, 96, 96]
-            'dense_offsets': dense_offsets,     # [B, 8, 96, 96]
+            'corners_visual': corners_visual,   # Raw predicted corners matching visual GT
+            'dense_center': dense_center,       # [B, 1, H/4, W/4]
+            'dense_geom': dense_geom,           # [B, 10, H/4, W/4]
         }

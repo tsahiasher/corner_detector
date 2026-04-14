@@ -16,7 +16,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
-from common.visualization import draw_indexed_corners, save_diagnostic_visualization
+from common.visualization import save_diagnostic_visualization
 from common.checkpoint import load_checkpoint
 from coarse.models.coarse_quad_net import CoarseQuadNet
 
@@ -49,7 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--image', type=str, required=True, help="Path to the input image or directory of images.")
     parser.add_argument('--output_dir', type=str, default='', help="Directory to save execution artifacts (visualizations, JSON).")
     add_device_args(parser, default='cpu')
-    parser.add_argument('--input_size', type=int, default=384, help="Model structural input square dimension scale limit.")
+    parser.add_argument('--min_size', type=int, default=800, help="Minimum image dimension for resizing.")
+    parser.add_argument('--max_size', type=int, default=1333, help="Maximum image dimension for resizing.")
     
     parser.add_argument('--save_json', action='store_true', default=True, help="Flag to export explicit numeric result limits coordinates to a JSON payload.")
     parser.add_argument('--save_vis', action='store_true', default=True, help="Flag to generate and save a visualization overlaid upon the absolute original image scale.")
@@ -62,16 +63,29 @@ def parse_args() -> argparse.Namespace:
     
     return parser.parse_args()
 
-def preprocess_image(image: Image.Image, target_size: int, device: torch.device) -> torch.Tensor:
-    img_resized = TF.resize(image, [target_size, target_size])
+def preprocess_image(image: Image.Image, min_size: int, max_size: int, device: torch.device) -> torch.Tensor:
+    from common.transforms import ResizeMinMax
+    resizer = ResizeMinMax(min_size=min_size, max_size=max_size)
+    # ResizeMinMax expects (image, keypoints), we pass empty keypoints
+    img_resized, _ = resizer(image, [])
+    
     tensor = TF.to_tensor(img_resized)
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     tensor = TF.normalize(tensor, mean=mean, std=std)
-    return tensor.unsqueeze(0).to(device)
+    tensor = tensor.unsqueeze(0).to(device)
+    
+    # Ensure dimensions are multiples of 32 for the FPN backbone
+    h, w = tensor.shape[2:]
+    new_h = ((h + 31) // 32) * 32
+    new_w = ((w + 31) // 32) * 32
+    if new_h != h or new_w != w:
+        tensor = torch.nn.functional.pad(tensor, (0, new_w - w, 0, new_h - h))
+        
+    return tensor
 
 def save_visualization(image: Image.Image, corners_norm: list, corners_px: List[List[int]],
-                       img_path: str, output_dir: str, input_size: int) -> None:
+                       img_path: str, output_dir: str) -> None:
     """Draws indexed predicted corners on the original-scale image and saves it.
 
     Args:
@@ -129,7 +143,7 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
     
     # Preprocess
     t0 = sync_time()
-    input_tensor = preprocess_image(image, args.input_size, device)
+    input_tensor = preprocess_image(image, args.min_size, args.max_size, device)
     t_prep = sync_time() - t0
     
     # Inference
@@ -140,10 +154,12 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
     if 'score' not in out_dict:
         return None
         
+    logger.info(f"  Input Shape:  {list(input_tensor.shape)}")
     score_val = out_dict['score'][0, 0].item()
     corners_norm = out_dict['corners'][0].cpu().tolist()
     t_infer = sync_time() - t0
     
+    t0 = sync_time()
     corners_px = []
     for (nx, ny) in corners_norm:
         x_px = int(round(nx * orig_w))
@@ -155,7 +171,7 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
 
     # Actions
     if not args.no_vis and args.save_vis:
-        save_visualization(image, corners_norm, corners_px, img_path, args.output_dir, args.input_size)
+        save_visualization(image, corners_norm, corners_px, img_path, args.output_dir)
         
         # Performance Boost v2: Save diagnostic triple-view if mask/edges available
         if 'mask' in out_dict and 'edges' in out_dict:

@@ -22,7 +22,7 @@ Do not default to heavyweight generic detectors unless the user explicitly asks 
 Use this 4-stage design as the default:
 
 1. **Coarse detector (CenterNet-style Anchor)**
-   - Run a lightweight CPU-friendly backbone on a fixed `384x384` input.
+   - Run a lightweight CPU-friendly backbone on a fixed input.
    - **Crucial Pattern**: Do NOT use 4 independent dense heatmaps for the 4 corners. Rigid textured objects (like ID cards) cause extreme false-positive hallucination.
    - **Crucial Pattern**: Do NOT use `AdaptiveAvgPool` global pooling for spatial coordinate regression, as it destroys translation equivariance.
    - **Architecture**: Use a single-anchor CenterNet approach:
@@ -73,7 +73,7 @@ Dataset rules:
 - **Crucial Pattern**: NEVER trust native dataset keypoint annotation order. Calculate the planar geometric centroid and sort all 4 parsed bounding targets uniformly by `math.atan2` explicitly before sending them to optimization layers or metrics.
 - **Fail Loudly**: NEVER silently yield dummy default coordinates (e.g., `[0,0], [1,0]`) if label files are entirely missing/malformed. Throw loud mapping errors immediately to prevent `0.00` train loss network collapse.
 - Images may be portrait, landscape, tightly cropped, padded, rotated, or skewed.
-- Model input size is fixed at `384x384`.
+- Model input size is fixed.
 
 ## Output contract
 

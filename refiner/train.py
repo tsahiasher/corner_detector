@@ -75,6 +75,10 @@ def main() -> None:
     set_seed(42)
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
+    
+    if os.name == 'nt' and device.type == 'cpu' and args.num_workers > 0:
+        logger.warning("Windows CPU detected: setting num_workers=0 to prevent shared file mapping error <1455>.")
+        args.num_workers = 0
 
     logger.info("Initializing datasets...")
     train_dataset = RefineKeypointDataset(args.train_images, is_train=True, jitter_px=args.jitter_px, patch_size=args.patch_size)

@@ -41,7 +41,7 @@ python coarse\test.py --weights coarse\runs\20260321_194732\checkpoints\best.pt
 
 python coarse\export_torchscript.py --weights coarse\runs\20260321_194732\checkpoints\best.pt --output coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt
 
-python coarse\run_torchscript_image.py --model coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt --image your_id_card.jpg
+python coarse\run_torchscript_image.py --model coarse\runs\20260413_145547\checkpoints\coarse_quad_net.pt --image your_id_card.jpg
 
 python refiner\train.py --epochs 50 --batch_size 480
 

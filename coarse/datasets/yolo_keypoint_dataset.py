@@ -19,10 +19,12 @@ class YOLOKeypointDataset(Dataset):
     
     Args:
         images_dir (str): Root directory path containing training or validation images.
-        image_size (int, optional): Target size to resize images to. Defaults to 384.
+        image_size (int, optional): Target static size to resize images to. Defaults to None.
+        min_size (int, optional): Minimum edge for dynamic resize. Defaults to 800.
+        max_size (int, optional): Maximum edge for dynamic resize. Defaults to 1333.
         is_train (bool, optional): If True, applies training augmentations. Defaults to True.
     """
-    def __init__(self, images_dir: str, image_size: int = 384, is_train: bool = True) -> None:
+    def __init__(self, images_dir: str, image_size: int = None, min_size: int = 800, max_size: int = 1333, is_train: bool = True) -> None:
         self.images_dir = images_dir
         
         extensions = ('*.jpg', '*.jpeg', '*.png')
@@ -32,8 +34,10 @@ class YOLOKeypointDataset(Dataset):
         self.image_paths.sort()
             
         self.image_size = image_size
+        self.min_size = min_size
+        self.max_size = max_size
         self.is_train = is_train
-        self.transforms = get_train_transforms(image_size, is_train=is_train)
+        self.transforms = get_train_transforms(image_size=image_size, min_size=min_size, max_size=max_size, is_train=is_train)
         
     def _get_label_path(self, image_path: str) -> str:
         # In standard YOLO setups, labels are usually in a sibling "labels" directory
@@ -108,3 +112,51 @@ class YOLOKeypointDataset(Dataset):
             'orig_width': torch.tensor(float(orig_w)),
             'orig_height': torch.tensor(float(orig_h))
         }
+
+def collate_fn_pad(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collates a batch of images and dynamically pads them to max size in batch."""
+    images = [item['image'] for item in batch]
+    corners = [item['corners'] for item in batch]
+    orients = [item['orient'] for item in batch]
+    img_paths = [item['img_path'] for item in batch]
+    orig_widths = [item['orig_width'] for item in batch]
+    orig_heights = [item['orig_height'] for item in batch]
+    indices = [item['index'] for item in batch]
+    
+    scaled_widths = [img.shape[2] for img in images]
+    scaled_heights = [img.shape[1] for img in images]
+    
+    max_h = max(scaled_heights)
+    max_w = max(scaled_widths)
+    
+    # Must be divisible by 32 for backbone downsampling
+    max_h = ((max_h + 31) // 32) * 32
+    max_w = ((max_w + 31) // 32) * 32
+
+    padded_images = []
+    adjusted_corners = []
+    
+    for img, corner in zip(images, corners):
+        c, h, w = img.shape
+        # Padding format: (left, right, top, bottom)
+        pad_len = (0, max_w - w, 0, max_h - h)
+        padded_img = torch.nn.functional.pad(img, pad_len, value=0.0)
+        padded_images.append(padded_img)
+        
+        # Adjust normalized coordinates.
+        corner_adjusted = corner.clone()
+        corner_adjusted[:, 0] = corner_adjusted[:, 0] * (w / max_w)
+        corner_adjusted[:, 1] = corner_adjusted[:, 1] * (h / max_h)
+        adjusted_corners.append(corner_adjusted)
+        
+    return {
+        'index': torch.tensor(indices, dtype=torch.long),
+        'image': torch.stack(padded_images, dim=0),
+        'corners': torch.stack(adjusted_corners, dim=0),
+        'orient': torch.stack(orients, dim=0),
+        'img_path': img_paths,
+        'orig_width': torch.stack(orig_widths, dim=0),
+        'orig_height': torch.stack(orig_heights, dim=0),
+        'scaled_width': torch.tensor(scaled_widths, dtype=torch.float32),
+        'scaled_height': torch.tensor(scaled_heights, dtype=torch.float32)
+    }

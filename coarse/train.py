@@ -12,13 +12,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from coarse.models.coarse_quad_net import CoarseQuadNet
-from coarse.datasets.yolo_keypoint_dataset import YOLOKeypointDataset
+from coarse.datasets.yolo_keypoint_dataset import YOLOKeypointDataset, collate_fn_pad
 from coarse.datasets.coco_val_dataset import COCOValDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
-from common.metrics import (DiceLoss, GeometryAlignmentLoss, HeatmapFocalLoss, 
+from common.metrics import (DiceLoss, HeatmapFocalLoss, 
                             calculate_accuracy_metrics, compute_patch_recall, 
-                            CenterOffsetL1Loss)
+                            BoundingBoxCornerL1Loss)
+from common.geometry import sort_corners_clockwise
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.logging_utils import TrainingTracker, TopLossTracker, HardExampleMiner
 from common.visualization import save_diagnostic_visualization
@@ -49,7 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--val_json', type=str, default='../crop-dataset-eitan-yolo/annotations/val.json', help="Path to validation COCO JSON.")
     parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs.")
     parser.add_argument('--batch_size', type=int, default=16, help="Training batch size.")
-    parser.add_argument('--image_size', type=int, default=384, help="Input image spatial size.")
+    parser.add_argument('--min_size', type=int, default=800, help="Minimum image dimension.")
+    parser.add_argument('--max_size', type=int, default=1333, help="Maximum image dimension.")
     parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate.")
     parser.add_argument('--runs_dir', type=str, default='./coarse/runs', help="Base directory for training runs.")
     parser.add_argument('--name', type=str, default='', help="Optional suffix for the run directory.")
@@ -60,10 +62,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pin_memory', action='store_true', default=True, help="Use pinned memory for faster GPU transfer.")
     parser.add_argument('--grad_clip', type=float, default=1.0, help="Gradient clipping value (0 to disable).")
     
-    # Simplified Loss Weights (v8.0 - orient head removed)
-    parser.add_argument('--w_offset', type=float, default=1.0, help="Dense Sub-grid Offset L1 Loss.")
+    # Simplified Loss Weights (v8.0)
+    parser.add_argument('--w_offset', type=float, default=10.0, help="Dense Sub-grid Offset L1 Loss.")
     parser.add_argument('--w_heatmap', type=float, default=1.0, help="Dense Heatmap supervision (Focal Loss).")
-    parser.add_argument('--w_coord_quad', type=float, default=0.5, help="Auxiliary global quad anchoring loss.")
 
     # Mining
     parser.add_argument('--mine_hard', action='store_true', default=True, help="Enable hard example mining.")
@@ -88,22 +89,28 @@ def main() -> None:
 
     logger = setup_logging(os.path.join(run_dir, 'logs', 'train.log'))
     logger.info(f"Run directory: {run_dir}")
-    logger.info(f"Stage 1 Redesign Losses: Heatmap={args.w_heatmap}, DenseCoord={args.w_offset}, QuadCoord={args.w_coord_quad}")
+    logger.info(f"Stage 1 Redesign Losses: Heatmap={args.w_heatmap}, DenseCoord={args.w_offset}")
     
     tracker = TrainingTracker(logger)
     set_seed(42)
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
+    
+    if os.name == 'nt' and device.type == 'cpu' and args.num_workers > 0:
+        logger.warning("Windows CPU detected: setting num_workers=0 to prevent shared file mapping error <1455>.")
+        args.num_workers = 0
 
     logger.info("Initializing datasets...")
-    train_dataset = YOLOKeypointDataset(args.train_images, image_size=args.image_size)
-    val_dataset = COCOValDataset(args.val_images, args.val_json, image_size=args.image_size)
+    train_dataset = YOLOKeypointDataset(args.train_images, image_size=None, min_size=args.min_size, max_size=args.max_size, is_train=True)
+    # COCO might need updates if not dynamic, using YOLO for both typically, but the original code used COCOValDataset
+    # We will pass min_size and max_size to COCOValDataset as well (we need to update COCOValDataset to accept these)
+    val_dataset = COCOValDataset(args.val_images, args.val_json, image_size=None, min_size=args.min_size, max_size=args.max_size)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
-                              num_workers=args.num_workers, pin_memory=args.pin_memory)
+                              num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
 
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
-                            num_workers=args.num_workers, pin_memory=args.pin_memory)
+                            num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
 
     model = CoarseQuadNet().to(device)
     param_count = sum(p.numel() for p in model.parameters())
@@ -114,7 +121,7 @@ def main() -> None:
 
     # Loss Functions (v8.0)
     heatmap_criterion = HeatmapFocalLoss(alpha=2.0, beta=4.0)
-    offset_criterion = CenterOffsetL1Loss()
+    geom_criterion = BoundingBoxCornerL1Loss()
 
     start_epoch = 0
     best_mean_error = float('inf')
@@ -145,7 +152,7 @@ def main() -> None:
             weights = miner.get_weights(exponent=current_exponent)
             sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset), replacement=True)
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler,
-                                      num_workers=args.num_workers, pin_memory=args.pin_memory)
+                                      num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
             logger.info(f"Epoch {epoch+1}: Recreated train_loader (Mining Exp: {current_exponent:.2f}).")
 
         train_pbar = tqdm(train_loader, desc=f"Train Epoch {epoch+1}", leave=False)
@@ -159,26 +166,16 @@ def main() -> None:
             
             # --- Dynamic Corner Sorting (Physical to Visual) ---
             # CNN heatmaps/offsets are explicitly trained on 'visual' spatial geometry.
-            centroid = gt_corners.mean(dim=1, keepdim=True) # [B, 1, 2]
-            diffs = gt_corners - centroid
-            angles = torch.atan2(diffs[:, :, 1], diffs[:, :, 0]) # [B, 4]
-            sort_idx = torch.argsort(angles, dim=1) # [B, 4]
-            
-            B_cur = gt_corners.size(0)
-            b_idx_t = torch.arange(B_cur, device=device).unsqueeze(1).expand(B_cur, 4)
-            gt_corners_visual = gt_corners[b_idx_t, sort_idx] # [B, 4, 2]
-            
-            # The 'shift' mapping visual back to physical is simply the physical index of the visual TL
-            gt_orient = sort_idx[:, 0] # [B]
+            gt_corners_visual = sort_corners_clockwise(gt_corners)
             
             # Compute Exact Centroid [B, 1, 2]
             gt_centers = gt_corners_visual.mean(dim=1, keepdim=True)
             
             # 1. Primary Dense Spatial Supervision
-            loss_offset = offset_criterion(out['dense_offsets'], gt_centers, gt_corners_visual)
+            loss_geom = geom_criterion(out['dense_geom'], gt_centers, gt_corners_visual)
             loss_heatmap = heatmap_criterion(out['dense_center'], gt_centers)
             
-            total_loss = (loss_offset * args.w_offset + 
+            total_loss = (loss_geom * args.w_offset + 
                           loss_heatmap * args.w_heatmap)
             
             total_loss.backward()
@@ -186,10 +183,10 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            # Detailed component logging (v8.0)
+            # Detailed component logging (v8.1)
             components = {
-                'offset_raw': loss_offset.item(),
-                'offset_w': (loss_offset * args.w_offset).item(),
+                'geom_raw': loss_geom.item(),
+                'geom_w': (loss_geom * args.w_offset).item(),
                 'heatmap_raw': loss_heatmap.item(),
                 'heatmap_w': (loss_heatmap * args.w_heatmap).item(),
             }
@@ -198,13 +195,23 @@ def main() -> None:
             
             # Update Miner with per-sample errors (Pixel space)
             with torch.no_grad():
-                w_orig = batch.get('orig_width', torch.tensor(args.image_size, device=device)).view(-1, 1)
-                h_orig = batch.get('orig_height', torch.tensor(args.image_size, device=device)).view(-1, 1)
+                # Get the actual padded width/height used for offsets
+                B_idx_temp = batch['image'].size(0)
+                pad_h = torch.tensor(batch['image'].shape[2], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
+                pad_w = torch.tensor(batch['image'].shape[3], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
+                
+                scaled_w = batch.get('scaled_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                orig_w = batch.get('orig_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                ratio_w = orig_w / scaled_w
+
+                scaled_h = batch.get('scaled_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                orig_h = batch.get('orig_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                ratio_h = orig_h / scaled_h
                 
                 # Use geometric visual corners for geometric mining
                 diff = (out['corners_visual'] - gt_corners_visual).abs()
-                diff[:, :, 0] *= w_orig
-                diff[:, :, 1] *= h_orig
+                diff[:, :, 0] *= (pad_w * ratio_w)
+                diff[:, :, 1] *= (pad_h * ratio_h)
                 
                 # Mining: Worst-corner prioritization
                 dist_max = torch.norm(diff, dim=-1).max(dim=-1)[0] # max error per image [B]
@@ -219,7 +226,7 @@ def main() -> None:
                 miner.update(batch['index'].tolist(), weights)
 
             del out, batch, total_loss, components
-            del loss_offset, loss_heatmap
+            del loss_geom, loss_heatmap
 
         tracker.end_train_phase()
         torch.cuda.empty_cache()
@@ -228,8 +235,7 @@ def main() -> None:
         model.eval()
         tracker.start_val_phase()
         all_errs = []
-        top_tracker = TopLossTracker(k=5)
-        
+        all_vis_data = []        
         val_pbar = tqdm(val_loader, desc=f"Val Epoch {epoch+1}", leave=False)
         with torch.inference_mode():
             for batch in val_pbar:
@@ -239,55 +245,59 @@ def main() -> None:
                 gt_corners = batch['corners']
                 
                 # --- Dynamic Corner Sorting (Physical to Visual) ---
-                centroid = gt_corners.mean(dim=1, keepdim=True) # [B, 1, 2]
-                diffs = gt_corners - centroid
-                angles = torch.atan2(diffs[:, :, 1], diffs[:, :, 0]) # [B, 4]
-                sort_idx = torch.argsort(angles, dim=1) # [B, 4]
-                
-                B_cur = gt_corners.size(0)
-                b_idx_t = torch.arange(B_cur, device=device).unsqueeze(1).expand(B_cur, 4)
-                gt_corners_visual = gt_corners[b_idx_t, sort_idx] # [B, 4, 2]
-                gt_orient = sort_idx[:, 0] # [B]
+                gt_corners_visual = sort_corners_clockwise(gt_corners)
                 gt_centers = gt_corners_visual.mean(dim=1, keepdim=True)
                 
                 # Val Loss tracking
-                loss_offset = offset_criterion(out['dense_offsets'], gt_centers, gt_corners_visual)
+                loss_geom = geom_criterion(out['dense_geom'], gt_centers, gt_corners_visual)
                 loss_heatmap = heatmap_criterion(out['dense_center'], gt_centers)
                 
-                val_total_loss = (loss_offset * args.w_offset + 
+                val_total_loss = (loss_geom * args.w_offset + 
                                   loss_heatmap * args.w_heatmap)
                 
                 components = {
-                    'offset_raw': loss_offset.item(),
-                    'offset_w': (loss_offset * args.w_offset).item(),
+                    'geom_raw': loss_geom.item(),
+                    'geom_w': (loss_geom * args.w_offset).item(),
                     'heatmap_raw': loss_heatmap.item(),
                     'heatmap_w': (loss_heatmap * args.w_heatmap).item(),
                 }
                 tracker.record_batch('val', val_total_loss.item(), sync_time() - batch_start, components=components)
 
                 # Accuracy (Pixel Space)
-                w_orig = batch.get('orig_width', torch.tensor(args.image_size, device=device)).view(-1, 1)
-                h_orig = batch.get('orig_height', torch.tensor(args.image_size, device=device)).view(-1, 1)
+                # Compute absolute pixel error on the padded grid shape to match predicted scale
+                B_idx_temp = out['corners'].size(0)
+                pad_h = torch.tensor(batch['image'].shape[2], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
+                pad_w = torch.tensor(batch['image'].shape[3], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
+
+                scaled_w = batch.get('scaled_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                orig_w = batch.get('orig_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                ratio_w = orig_w / scaled_w
+
+                scaled_h = batch.get('scaled_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                orig_h = batch.get('orig_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
+                ratio_h = orig_h / scaled_h
 
                 diff = (out['corners'] - gt_corners_visual).abs()
-                diff[:, :, 0] *= w_orig
-                diff[:, :, 1] *= h_orig
+                diff[:, :, 0] *= (pad_w * ratio_w)
+                diff[:, :, 1] *= (pad_h * ratio_h)
                 dist = torch.norm(diff, dim=-1) # [B, 4]
                 all_errs.append(dist.cpu())
                 
-                # Update top-loss samples
+                # Store metadata for all samples (without the 20MB image tensor)
                 m_dist = dist.mean(dim=-1)
                 for b_idx in range(batch['image'].size(0)):
-                    top_tracker.update(m_dist[b_idx].item(), {
-                        'image': batch['image'][b_idx],
-                        'pred': out['corners'][b_idx],
-                        'gt': gt_corners[b_idx],
-                        'path': batch['img_path'][b_idx]
+                    all_vis_data.append({
+                        'err': m_dist[b_idx].item(),
+                        'pred': out['corners'][b_idx].cpu(),
+                        'gt': gt_corners_visual[b_idx].cpu(),
+                        'path': batch['img_path'][b_idx],
+                        'pad_w': pad_w[b_idx].item(),
+                        'pad_h': pad_h[b_idx].item()
                     })
                 
                 # Explicitly free variables
-                del out, batch, val_total_loss, components
-                del loss_offset, loss_heatmap
+                del out, batch, components
+                del loss_geom, loss_heatmap
 
         tracker.end_val_phase()
         torch.cuda.empty_cache()
@@ -301,14 +311,45 @@ def main() -> None:
         tracker.log_epoch_summary(epoch + 1, args.epochs, current_lr, metrics, recall_val)
         scheduler.step()
 
-        # Save Visualizations
+        # Save Visualizations (Top 5 and Median 5)
         epoch_vis_dir = os.path.join(vis_dir, f"epoch_{epoch+1:03d}")
-        for sample in top_tracker.get_samples():
-            save_diagnostic_visualization(
-                sample['image'], sample['pred'], sample['gt'],
-                None, None, # No mask/edges in redesigned version
-                sample['path'], epoch_vis_dir
-            )
+        os.makedirs(epoch_vis_dir, exist_ok=True)
+        
+        all_vis_data.sort(key=lambda x: x['err'], reverse=True)
+        top_5 = all_vis_data[:5]
+        
+        median_idx = len(all_vis_data) // 2
+        median_5 = all_vis_data[max(0, median_idx-2) : median_idx+3]
+        
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+        from common.transforms import get_train_transforms
+        vis_transforms = get_train_transforms(image_size=None, min_size=args.min_size, max_size=args.max_size, is_train=False)
+
+        def dump_vis_set(subset, prefix):
+            for i, sample in enumerate(subset):
+                # 1. Reload the image and simulate the padding dynamically to match the tensor constraint
+                try:
+                    raw_img = Image.open(sample['path']).convert("RGB")
+                except:
+                    continue
+                img_t, _ = vis_transforms(raw_img, [])
+                c, h, w = img_t.shape
+                # Must cast to int as pad_w/pad_h were stored as floats
+                pad_w_int = int(sample['pad_w'])
+                pad_h_int = int(sample['pad_h'])
+                pad_len = (0, max(0, pad_w_int - w), 0, max(0, pad_h_int - h))
+                padded_img = torch.nn.functional.pad(img_t, pad_len, value=0.0)
+                
+                # 2. Draw
+                save_diagnostic_visualization(
+                    padded_img, sample['pred'], sample['gt'],
+                    None, None,
+                    f"{prefix}_{i}_err_{sample['err']:.1f}_{os.path.basename(sample['path'])}", epoch_vis_dir
+                )
+
+        dump_vis_set(top_5, "top")
+        dump_vis_set(median_5, "median")
 
         # Checkpoint (Targeting recall_96 explicitly)
         latest_path = os.path.join(run_dir, 'checkpoints', 'last.pt')
