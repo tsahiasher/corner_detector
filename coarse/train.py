@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     # YOLO-Pose Loss Weights
     parser.add_argument('--w_obj', type=float, default=1.0, help='Objectness (focal) loss weight.')
     parser.add_argument('--w_box', type=float, default=5.0, help='CIoU bounding-box loss weight.')
-    parser.add_argument('--w_kpt', type=float, default=10.0, help='Keypoint regression loss weight.')
+    parser.add_argument('--w_kpt', type=float, default=0.2, help='Keypoint regression loss weight.')
 
     # Mining
     parser.add_argument('--mine_hard', action='store_true', default=True, help="Enable hard example mining.")

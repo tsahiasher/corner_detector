@@ -240,10 +240,15 @@ class YOLOPoseLoss(nn.Module):
 
         loss_box = self._ciou(pcx, pcy, pw, ph, gcx, gcy, gw, gh)
 
-        # ---- 3. Keypoint Smooth-L1 (at GT cell) ----
+        # ---- 3. Keypoint L1 (at GT cell, in grid-pixel space) ----
         kpt_raw = raw_pred[bi, 5:13, gi, gj]   # [B, 8]
         pred_kpt = torch.sigmoid(kpt_raw).view(B, 4, 2)
-        loss_kpt = F.smooth_l1_loss(pred_kpt, gt_corners)
+        # Scale to grid-pixel space so kpt loss magnitude (~15-30) is
+        # comparable to obj (~3) and box (~0.2) instead of being ~0.004.
+        kpt_scale = torch.tensor(
+            [float(Wg), float(Hg)], device=device, dtype=torch.float32,
+        ).view(1, 1, 2)
+        loss_kpt = F.l1_loss(pred_kpt * kpt_scale, gt_corners * kpt_scale)
 
         # ---- Total ----
         total = (loss_obj * self.w_obj
