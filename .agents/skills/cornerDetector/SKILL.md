@@ -21,15 +21,16 @@ Do not default to heavyweight generic detectors unless the user explicitly asks 
 
 Use this 4-stage design as the default:
 
-1. **Coarse detector (CenterNet-style Anchor)**
-   - Run a lightweight CPU-friendly backbone on a fixed input.
-   - **Crucial Pattern**: Do NOT use 4 independent dense heatmaps for the 4 corners. Rigid textured objects (like ID cards) cause extreme false-positive hallucination.
-   - **Crucial Pattern**: Do NOT use `AdaptiveAvgPool` global pooling for spatial coordinate regression, as it destroys translation equivariance.
-   - **Architecture**: Use a single-anchor CenterNet approach:
-     - Predict 1 center heatmap locating the object's core.
-     - Predict 8 sub-pixel `(dx, dy)` spatial offsets targeting the 4 visual corners from that center grid cell.
-     - **Do NOT add an orientation head to the coarse model.** A single center-pixel feature vector cannot generalize card orientation semantics (text direction, face side). Use `atan2` angle-sort to produce geometrically consistent corner ordering instead.
-   - Extract the `argmax` from the center heatmap, gather the offsets at that exact point, compute the 4 visual corners, and sort by `atan2(dy, dx)` ascending.
+1. **Coarse detector (Spatially-Aware Bounding Box Regressor)**
+   - Run a lightweight CPU-friendly backbone on a fixed padded input.
+   - **Crucial Pattern**: Do NOT use 4 independent dense heatmaps for the corners.
+   - **Crucial Pattern**: Do NOT use massive `AdaptiveAvgPool` global pooling dropping straight into independent coordinate MLPs since it wipes away structural relationships.
+   - **Architecture**: Use a progressive spatial reduction regressor explicitly outputting a unified bounding box:
+     - Output exactly ONE object prediction configuration natively.
+     - Use a ResNet-18 Backbone scaled down to its final layer space.
+     - Attach a specialized Conv Neck preserving a moderate spatial grid (e.g., `4x4`) routing into a dense layout to conserve bounding geometric boundaries naturally before squashing coordinates out.
+     - Eliminate score objectness networks entirely for environments assuming purely 1 card per image stream.
+   - Downstream processes manually expand this generalized bounding block configuration.
 
 2. **Stage 2.5 – Orientation classification (OrientNet, optional)**
    - Run ONLY after the coarse model has localized the card.
@@ -223,13 +224,9 @@ Do not treat loss as the primary success metric once evaluation metrics are avai
 
 For the coarse detector:
 - keep the backbone lightweight and CPU-friendly
-- preserve spatial information in the head
-- prefer low-resolution spatial prediction over pure global regression
-- heatmap-style reasoning is acceptable and preferred in stage 1 when it improves robustness
-- stage 1 remains coarse localization
-- stage 2 still performs higher-precision local refinement
-
-Do not assume heatmaps belong only to stage 2. Low-resolution heatmaps in stage 1 are often the right production tradeoff for robustness and CPU efficiency.
+- preserve spatial information in the head (do NOT drop straight to 1x1 Global Average Pooling dynamically mapping outputs without intermediary preservation bounds)
+- output exactly 1 strict bounding context natively per image assuming ID cards stream inherently.
+- explicitly optimize around a generalized target bounding box structure relying on `SmoothL1` alongside `GIoU` boundary constraints natively.
 
 ## Training guidance
 
@@ -276,3 +273,5 @@ Always prefer:
 As work on the project progresses, keep this `SKILL.md` up to date with anything learned that would improve future implementation, debugging, training, evaluation, export, or deployment for this project.
 
 If there is a tradeoff between prettier abstractions and clearer deployment-safe code, prefer the clearer deployment-safe code.
+
+> Note: All code development for this repository assumes a Windows primary environment explicitly. Training loop components and dataset parsing remains universally compliant, while worker thread spawning and path mappings expect Windows OS structural fallbacks implicitly.

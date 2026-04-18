@@ -115,146 +115,271 @@ class WingLoss(nn.Module):
         return loss.mean()
 
 
-class YOLOPoseLoss(nn.Module):
-    """Combined YOLO-Pose loss for single-object keypoint detection.
+class KeyPointLoss(nn.Module):
+    """KeyPoints loss with center-radius multi-scale positive assignment.
 
-    Computes three loss terms, all supervised at the ground-truth centre cell:
+    Five loss terms are computed across all prediction scales:
 
-    1. **Objectness** – CenterNet focal loss on a Gaussian heatmap target.
-    2. **Bounding box** – Complete-IoU (CIoU) loss on axis-aligned bbox.
-    3. **Keypoints** – Smooth-L1 on absolute normalised corner positions.
+    1. **Objectness** - BCE (all cells, sum / num_pos for balance).
+    2. **Bounding box** - CIoU (positive cells only).
+    3. **Keypoints** - L1 on cell-relative decoded normalised coordinates
+       (positive cells only).
+    4. **Keypoint confidence** - BCE on ALL cells (pos target=1, neg
+       target=0) so that non-responsible cells predict low confidence
+       and joint ``obj x mean(kpt_conf)`` scoring works at inference.
+    5. **Box-corner consistency** - (1 - IoU) between the predicted box
+       and the box derived from predicted corners (positive cells only).
+       Forces box and corner heads to agree geometrically.
+
+    Positive assignment: all grid cells within ``center_radius`` of the
+    GT centre are labelled positive.
 
     Args:
-        w_obj:  Weight for objectness focal loss.
+        w_obj:  Weight for objectness loss.
         w_box:  Weight for CIoU bounding-box loss.
-        w_kpt:  Weight for keypoint regression loss.
-        sigma:  Gaussian spread for the objectness heatmap target.
+        w_kpt:  Weight for keypoint L1 loss.
+        w_kpt_conf: Weight for keypoint confidence BCE loss.
+        w_consist: Weight for box-corner consistency loss.
+        center_radius: Radius (in grid cells) for positive assignment.
+        num_kpt: Number of keypoints (4 corners).
     """
 
-    def __init__(self, w_obj: float = 1.0, w_box: float = 5.0,
-                 w_kpt: float = 10.0, sigma: float = 2.0) -> None:
+    def __init__(
+        self,
+        w_obj: float = 1.0,
+        w_box: float = 7.5,
+        w_kpt: float = 12.0,
+        w_kpt_conf: float = 1.0,
+        w_consist: float = 1.0,
+        center_radius: float = 2.5,
+        num_kpt: int = 4,
+    ) -> None:
         super().__init__()
         self.w_obj = w_obj
         self.w_box = w_box
         self.w_kpt = w_kpt
-        self.obj_loss_fn = HeatmapFocalLoss(sigma=sigma)
+        self.w_kpt_conf = w_kpt_conf
+        self.w_consist = w_consist
+        self.center_radius = center_radius
+        self.num_kpt = num_kpt
 
+    # ------------------------------------------------------------------ #
     @staticmethod
-    def _ciou(pcx: torch.Tensor, pcy: torch.Tensor,
-              pw: torch.Tensor, ph: torch.Tensor,
-              gcx: torch.Tensor, gcy: torch.Tensor,
-              gw: torch.Tensor, gh: torch.Tensor) -> torch.Tensor:
-        """Complete-IoU loss between predicted and GT boxes (normalised coords).
-
-        Args:
-            pcx, pcy, pw, ph: Predicted centre-x, centre-y, width, height.
-            gcx, gcy, gw, gh: Ground-truth centre-x, centre-y, width, height.
-
-        Returns:
-            Scalar CIoU loss (1 − CIoU), averaged over batch.
-        """
+    def _ciou_elementwise(
+        pcx: torch.Tensor, pcy: torch.Tensor,
+        pw: torch.Tensor, ph: torch.Tensor,
+        gcx: torch.Tensor, gcy: torch.Tensor,
+        gw: torch.Tensor, gh: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorised per-element CIoU loss  →  ``(1 − CIoU)``."""
         eps = 1e-7
-
-        # Convert to xyxy
         px1, py1 = pcx - pw / 2, pcy - ph / 2
         px2, py2 = pcx + pw / 2, pcy + ph / 2
         gx1, gy1 = gcx - gw / 2, gcy - gh / 2
         gx2, gy2 = gcx + gw / 2, gcy + gh / 2
 
-        # Intersection
         ix1 = torch.max(px1, gx1)
         iy1 = torch.max(py1, gy1)
         ix2 = torch.min(px2, gx2)
         iy2 = torch.min(py2, gy2)
-        inter = torch.clamp(ix2 - ix1, min=0) * torch.clamp(iy2 - iy1, min=0)
+        inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
 
-        # Union
         union = pw * ph + gw * gh - inter + eps
         iou = inter / union
 
-        # Smallest enclosing box diagonal²
         ex1 = torch.min(px1, gx1)
         ey1 = torch.min(py1, gy1)
         ex2 = torch.max(px2, gx2)
         ey2 = torch.max(py2, gy2)
         c_sq = (ex2 - ex1) ** 2 + (ey2 - ey1) ** 2 + eps
-
-        # Centre distance²
         rho_sq = (pcx - gcx) ** 2 + (pcy - gcy) ** 2
 
-        # Aspect-ratio consistency penalty
         v = (4.0 / (math.pi ** 2)) * (
             torch.atan(gw / (gh + eps)) - torch.atan(pw / (ph + eps))
         ) ** 2
         with torch.no_grad():
             alpha = v / ((1.0 - iou) + v + eps)
 
-        ciou = iou - rho_sq / c_sq - alpha * v
-        return (1.0 - ciou).mean()
+        return 1.0 - (iou - rho_sq / c_sq - alpha * v)
 
-    def forward(self, raw_pred: torch.Tensor,
-                gt_corners: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute the combined YOLO-Pose loss.
+    # ------------------------------------------------------------------ #
+    def forward(
+        self,
+        raw_preds: List[torch.Tensor],
+        gt_corners: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute multi-scale KeyPoints loss.
 
         Args:
-            raw_pred:   Raw model grid output ``[B, 13, Hg, Wg]``.
-            gt_corners: Ground-truth corner keypoints ``[B, 4, 2]``,
-                        normalised to ``[0, 1]``.
+            raw_preds:  List of ``[B, 17, Hi, Wi]`` raw predictions
+                        (one per FPN scale).
+            gt_corners: ``[B, 4, 2]`` normalised GT corner coordinates.
 
         Returns:
-            Dict with scalar tensors: ``total``, ``obj``, ``box``, ``kpt``.
+            Dict with scalar tensors:
+            ``total``, ``obj``, ``box``, ``kpt``, ``kpt_conf``, ``consist``.
         """
-        B, _, Hg, Wg = raw_pred.shape
-        device = raw_pred.device
+        device = raw_preds[0].device
+        B = raw_preds[0].size(0)
 
-        # ---- Ground-truth derived quantities ----
-        gt_ctr = gt_corners.mean(dim=1, keepdim=True)  # [B, 1, 2]
-
+        # GT axis-aligned bounding box derived from corners
         gx_min = gt_corners[:, :, 0].min(1).values
         gy_min = gt_corners[:, :, 1].min(1).values
         gx_max = gt_corners[:, :, 0].max(1).values
         gy_max = gt_corners[:, :, 1].max(1).values
-        gcx = (gx_min + gx_max) / 2
-        gcy = (gy_min + gy_max) / 2
-        gw = (gx_max - gx_min).clamp(min=1e-6)
-        gh = (gy_max - gy_min).clamp(min=1e-6)
+        gt_cx = (gx_min + gx_max) / 2
+        gt_cy = (gy_min + gy_max) / 2
+        gt_w = (gx_max - gx_min).clamp(min=1e-6)
+        gt_h = (gy_max - gy_min).clamp(min=1e-6)
 
-        # Positive cell indices
-        gj = torch.clamp((gt_ctr[:, 0, 0] * Wg).long(), 0, Wg - 1)
-        gi = torch.clamp((gt_ctr[:, 0, 1] * Hg).long(), 0, Hg - 1)
-        bi = torch.arange(B, device=device)
+        sum_obj = torch.zeros(1, device=device)
+        sum_box = torch.zeros(1, device=device)
+        sum_kpt = torch.zeros(1, device=device)
+        sum_kpt_conf = torch.zeros(1, device=device)
+        sum_consist = torch.zeros(1, device=device)
+        total_num_pos = 0
 
-        # ---- 1. Objectness (Focal Heatmap) ----
-        loss_obj = self.obj_loss_fn(raw_pred[:, 0:1], gt_ctr)
+        for raw in raw_preds:
+            _, _, H, W = raw.shape
 
-        # ---- 2. Bounding-box CIoU (at GT cell) ----
-        tx = raw_pred[bi, 1, gi, gj]
-        ty = raw_pred[bi, 2, gi, gj]
-        tw = raw_pred[bi, 3, gi, gj]
-        th = raw_pred[bi, 4, gi, gj]
+            gy_grid, gx_grid = torch.meshgrid(
+                torch.arange(H, device=device, dtype=torch.float32),
+                torch.arange(W, device=device, dtype=torch.float32),
+                indexing='ij',
+            )
 
-        pcx = (torch.sigmoid(tx) + gj.float()) / Wg
-        pcy = (torch.sigmoid(ty) + gi.float()) / Hg
-        pw = torch.sigmoid(tw)
-        ph = torch.sigmoid(th)
+            gt_gj = gt_cx * W
+            gt_gi = gt_cy * H
 
-        loss_box = self._ciou(pcx, pcy, pw, ph, gcx, gcy, gw, gh)
+            pos_mask = torch.zeros(B, H, W, device=device, dtype=torch.bool)
+            for b in range(B):
+                dist = torch.sqrt(
+                    (gx_grid - gt_gj[b]) ** 2 + (gy_grid - gt_gi[b]) ** 2
+                )
+                pos_mask[b] = dist <= self.center_radius
 
-        # ---- 3. Keypoint Smooth-L1 (at GT cell) ----
-        kpt_raw = raw_pred[bi, 5:13, gi, gj]   # [B, 8]
-        pred_kpt = torch.sigmoid(kpt_raw).view(B, 4, 2)
-        loss_kpt = F.smooth_l1_loss(pred_kpt, gt_corners)
+            num_pos = max(pos_mask.sum().item(), 1)
+            total_num_pos += num_pos
 
-        # ---- Total ----
-        total = (loss_obj * self.w_obj
-                 + loss_box * self.w_box
-                 + loss_kpt * self.w_kpt)
+            # ---- Decode predictions (full grid) ----
+            dec_cx = (torch.sigmoid(raw[:, 0]) * 2.0 - 0.5 + gx_grid) / W
+            dec_cy = (torch.sigmoid(raw[:, 1]) * 2.0 - 0.5 + gy_grid) / H
+            dec_bw = torch.sigmoid(raw[:, 2])
+            dec_bh = torch.sigmoid(raw[:, 3])
+
+            # ---- 1. Objectness BCE (all cells, normalised by #pos) ----
+            obj_loss = F.binary_cross_entropy_with_logits(
+                raw[:, 4], pos_mask.float(), reduction='sum',
+            ) / num_pos
+            sum_obj = sum_obj + obj_loss
+
+            # ---- 2. Box CIoU (positives only) ----
+            gcx_e = gt_cx.view(B, 1, 1).expand_as(dec_cx)[pos_mask]
+            gcy_e = gt_cy.view(B, 1, 1).expand_as(dec_cy)[pos_mask]
+            gw_e = gt_w.view(B, 1, 1).expand_as(dec_bw)[pos_mask]
+            gh_e = gt_h.view(B, 1, 1).expand_as(dec_bh)[pos_mask]
+
+            box_loss = self._ciou_elementwise(
+                dec_cx[pos_mask], dec_cy[pos_mask],
+                dec_bw[pos_mask], dec_bh[pos_mask],
+                gcx_e, gcy_e, gw_e, gh_e,
+            ).sum() / num_pos
+            sum_box = sum_box + box_loss
+
+            # ---- 3. Keypoint L1 (positives only) ----
+            scale_kpt_l1 = torch.zeros(1, device=device)
+
+            for k in range(self.num_kpt):
+                # Decode keypoint (cell-relative offset)
+                dec_kx = (raw[:, 5 + k * 3] * 2.0 + gx_grid) / W
+                dec_ky = (raw[:, 5 + k * 3 + 1] * 2.0 + gy_grid) / H
+
+                gt_kx = gt_corners[:, k, 0].view(B, 1, 1).expand(B, H, W)
+                gt_ky = gt_corners[:, k, 1].view(B, 1, 1).expand(B, H, W)
+
+                # L1 on normalised coordinates at positive cells
+                scale_kpt_l1 = scale_kpt_l1 + (
+                    torch.abs(dec_kx[pos_mask] - gt_kx[pos_mask])
+                    + torch.abs(dec_ky[pos_mask] - gt_ky[pos_mask])
+                ).sum()
+
+            sum_kpt = sum_kpt + scale_kpt_l1 / (num_pos * self.num_kpt)
+
+            # ---- 4. Keypoint confidence BCE (ALL cells) ----
+            kpt_conf_target = pos_mask.float()  # [B, H, W]
+
+            scale_kpt_conf = torch.zeros(1, device=device)
+            for k in range(self.num_kpt):
+                conf_logit = raw[:, 5 + k * 3 + 2]
+                scale_kpt_conf = scale_kpt_conf + (
+                    F.binary_cross_entropy_with_logits(
+                        conf_logit, kpt_conf_target, reduction='sum',
+                    )
+                )
+            scale_kpt_conf = scale_kpt_conf / (B * H * W * self.num_kpt)
+            sum_kpt_conf = sum_kpt_conf + scale_kpt_conf
+
+            # ---- 5. Box-corner consistency (positives only) ----
+            # Derive an axis-aligned box from the decoded corners and
+            # compare to the predicted box via IoU. Loss = 1 - IoU.
+            all_dec_kx = []
+            all_dec_ky = []
+            for k in range(self.num_kpt):
+                all_dec_kx.append((raw[:, 5 + k * 3] * 2.0 + gx_grid) / W)
+                all_dec_ky.append((raw[:, 5 + k * 3 + 1] * 2.0 + gy_grid) / H)
+            # Stack to [B, num_kpt, H, W]
+            kpt_xs = torch.stack(all_dec_kx, dim=1)
+            kpt_ys = torch.stack(all_dec_ky, dim=1)
+
+            # Corner-derived box (at positive cells)
+            kpt_x_min = kpt_xs.min(dim=1).values[pos_mask]  # [P]
+            kpt_x_max = kpt_xs.max(dim=1).values[pos_mask]
+            kpt_y_min = kpt_ys.min(dim=1).values[pos_mask]
+            kpt_y_max = kpt_ys.max(dim=1).values[pos_mask]
+
+            # Predicted box (at positive cells)
+            pred_x1 = (dec_cx - dec_bw / 2)[pos_mask]
+            pred_y1 = (dec_cy - dec_bh / 2)[pos_mask]
+            pred_x2 = (dec_cx + dec_bw / 2)[pos_mask]
+            pred_y2 = (dec_cy + dec_bh / 2)[pos_mask]
+
+            # IoU between corner-derived box and predicted box
+            eps = 1e-7
+            ix1 = torch.max(kpt_x_min, pred_x1)
+            iy1 = torch.max(kpt_y_min, pred_y1)
+            ix2 = torch.min(kpt_x_max, pred_x2)
+            iy2 = torch.min(kpt_y_max, pred_y2)
+            inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
+            area_kpt = (kpt_x_max - kpt_x_min).clamp(min=eps) * (kpt_y_max - kpt_y_min).clamp(min=eps)
+            area_box = (pred_x2 - pred_x1).clamp(min=eps) * (pred_y2 - pred_y1).clamp(min=eps)
+            iou = inter / (area_kpt + area_box - inter + eps)
+
+            consist_loss = (1.0 - iou).sum() / num_pos
+            sum_consist = sum_consist + consist_loss
+
+        # Average across scales
+        ns = float(len(raw_preds))
+        avg_obj = sum_obj / ns
+        avg_box = sum_box / ns
+        avg_kpt = sum_kpt / ns
+        avg_kpt_conf = sum_kpt_conf / ns
+        avg_consist = sum_consist / ns
+
+        total = (
+            avg_obj * self.w_obj
+            + avg_box * self.w_box
+            + avg_kpt * self.w_kpt
+            + avg_kpt_conf * self.w_kpt_conf
+            + avg_consist * self.w_consist
+        )
 
         return {
             'total': total,
-            'obj':   loss_obj,
-            'box':   loss_box,
-            'kpt':   loss_kpt,
+            'obj': avg_obj.detach(),
+            'box': avg_box.detach(),
+            'kpt': avg_kpt.detach(),
+            'kpt_conf': avg_kpt_conf.detach(),
+            'consist': avg_consist.detach(),
         }
 
 

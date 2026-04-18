@@ -19,7 +19,7 @@ from common.seed import set_seed
 from common.metrics import calculate_accuracy_metrics, compute_patch_recall
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.geometry import sort_corners_clockwise
-from common.visualization import save_diagnostic_visualization
+from common.transforms import denormalize_image
 
 
 def setup_logging(log_file: str) -> logging.Logger:
@@ -40,12 +40,11 @@ def setup_logging(log_file: str) -> logging.Logger:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate Coarse Quad network (Stage 1).")
+    parser = argparse.ArgumentParser(description="Evaluate Global Bounding Box Regressor (Stage 1).")
     parser.add_argument('--weights', type=str, required=True, help="Path to checkpoint (.pt) or TorchScript.")
     parser.add_argument('--val_images', type=str, default='../crop-dataset-eitan-yolo/images/val', help="Val images dir.")
     parser.add_argument('--val_json', type=str, default='../crop-dataset-eitan-yolo/annotations/val.json', help="Val COCO JSON.")
-    parser.add_argument('--min_size', type=int, default=800, help="Minimum image dimension for resizing.")
-    parser.add_argument('--max_size', type=int, default=1333, help="Maximum image dimension for resizing.")
+    parser.add_argument('--image_size', type=int, default=384, help="Fixed image dimension.")
     parser.add_argument('--batch_size', type=int, default=1, help="Batch size for eval.")
     add_device_args(parser, default='auto')
     parser.add_argument('--save_csv', action='store_true', default=True, help="Save per-image results.")
@@ -54,44 +53,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_diagnostic_visualization(image_t: torch.Tensor, pred_corners: torch.Tensor, gt_corners: torch.Tensor,
-                                 mask_t: torch.Tensor, edge_t: torch.Tensor,
+def save_diagnostic_visualization(image_t: torch.Tensor, pred_box: torch.Tensor, gt_corners: torch.Tensor,
                                  img_path: str, out_dir: str) -> None:
     """Saves a multi-panel visualization of geometric anchoring."""
     try:
         import cv2
-        from common.transforms import denormalize_image
     except ImportError:
         return
 
-    # Original Image with Quads
+    # Original Image
     img = denormalize_image(image_t.cpu()).permute(1, 2, 0).numpy()
     img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # Convert corners to pixel space
     h, w = img.shape[:2]
-    pred_px = (pred_corners.cpu().numpy() * [w, h]).astype(int)
+    
+    # Target Box Corners [cx, cy, w_box, h_box] -> [TL, TR, BR, BL]
+    def box_to_poly(b, ww, hh):
+        cx, cy, bw, bh = b
+        x1, y1 = int((cx - bw/2) * ww), int((cy - bh/2) * hh)
+        x2, y2 = int((cx + bw/2) * ww), int((cy + bh/2) * hh)
+        # Clockwise polygon: TL, TR, BR, BL
+        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
+        
+    pred_px = box_to_poly(pred_box.cpu().numpy(), w, h)
     gt_px = (gt_corners.cpu().numpy() * [w, h]).astype(int)
 
-    # Draw GT (blue) and Pred (orange)
+    # Draw GT corners (blue) and Pred Box (orange)
     cv2.polylines(img, [gt_px], True, (255, 0, 0), 2)
     cv2.polylines(img, [pred_px], True, (0, 165, 255), 2)
 
-    # Masks (48x48 upsampled)
-    mask = (mask_t[0].cpu().numpy() * 255).astype(np.uint8)
-    mask = cv2.resize(mask, (w, h))
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    
-    # Edges (48x48 upsampled)
-    edges = (edge_t[0].cpu().numpy() * 255).astype(np.uint8)
-    edges = cv2.resize(edges, (w, h))
-    edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-
-    # Stack results
-    combined = np.hstack([img, mask_bgr, edges_bgr])
     name = os.path.basename(img_path)
-    cv2.imwrite(os.path.join(out_dir, f"diag_{name}"), combined)
+    os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(out_dir, f"eval_diag_{name}"), img)
 
 
 def main() -> None:
@@ -107,13 +101,13 @@ def main() -> None:
     os.makedirs(os.path.join(run_dir, 'visualizations'), exist_ok=True)
 
     logger = setup_logging(os.path.join(run_dir, 'logs', 'eval.log'))
-    logger.info("=== Coarse Evaluation (Multi-task Geometric) ===")
+    logger.info("=== Coarse Evaluation (Global Regressor) ===")
 
     set_seed(42)
     device = resolve_device(args.device)
     log_device_info(device, args.device, logger)
 
-    val_dataset = COCOValDataset(args.val_images, args.val_json, min_size=args.min_size, max_size=args.max_size)
+    val_dataset = COCOValDataset(args.val_images, args.val_json, min_size=None, max_size=None, image_size=args.image_size)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
     # Load Model
@@ -133,24 +127,44 @@ def main() -> None:
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
             batch = move_batch_to_device(batch, device)
-            # --- Dynamic Corner Sorting (Semantic Alignment) ---
+            
+            gt_corners = batch['corners']
             gt_corners_visual = sort_corners_clockwise(gt_corners)
             
-            # Use structured corners for precision metrics
-            pred = out['corners']
+            # Predict
+            out = model(batch['image'])
+            pred_box = out['box']  # [B, 4]
+            
+            # Convert prediction box (cx, cy, w, h) to corner order (TL, TR, BR, BL)
+            # This allows distance checking directly vs GT corners.
+            cx = pred_box[:, 0:1]
+            cy = pred_box[:, 1:2]
+            bw = pred_box[:, 2:3]
+            bh = pred_box[:, 3:4]
+            
+            x1 = cx - bw/2
+            y1 = cy - bh/2
+            x2 = cx + bw/2
+            y2 = cy + bh/2
+            
+            # Shape for pred_corners: [B, 4, 2]
+            pred_corners = torch.stack([
+                torch.cat([x1, y1], dim=-1),
+                torch.cat([x2, y1], dim=-1),
+                torch.cat([x2, y2], dim=-1),
+                torch.cat([x1, y2], dim=-1)
+            ], dim=1)
 
-            # Compute pixel errors
-            # MUST use the same resolution-aware scaling as training
-            B_idx_temp = pred.size(0)
+            # Compute pixel errors relative to network input padding boundaries
+            B_idx_temp = pred_corners.size(0)
             pad_h = torch.tensor(batch['image'].shape[2], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
             pad_w = torch.tensor(batch['image'].shape[3], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
 
+            # In evaluate/test, pad_w/pad_h match orig_w/orig_h since we used purely ResizeImage (not min/max)
             orig_w = batch.get('orig_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
             orig_h = batch.get('orig_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
             
-            # In test mode, we assume the model output is relative to the padded [pad_h, pad_w]
-            # Since pred is normalized [0, 1] relative to the network input (padded)
-            diff = (pred - gt_corners_visual).abs()
+            diff = (pred_corners - gt_corners_visual).abs()
             diff[:, :, 0] *= orig_w
             diff[:, :, 1] *= orig_h
             dist = torch.norm(diff, dim=-1) # [B, 4]
@@ -165,8 +179,7 @@ def main() -> None:
 
             if args.save_vis and len(results) <= args.max_vis:
                 save_diagnostic_visualization(
-                    batch['image'][0], pred[0], gt_corners_visual[0],
-                    out['mask'][0], out['edges'][0],
+                    batch['image'][0], pred_box[0], gt_corners_visual[0],
                     batch['img_path'][0], os.path.join(run_dir, 'visualizations')
                 )
 
@@ -177,13 +190,13 @@ def main() -> None:
     logger.info("\n" + "="*50)
     logger.info("=== EVALUATION REPORT (Stage 1) ===")
     logger.info("="*50)
-    logger.info(f"Mean Pixel Error: {metrics['mean']:.3f}")
-    logger.info(f"Median Pixel Error: {metrics['median']:.3f}")
+    logger.info(f"Mean Pixel Error: {metrics['mean']:.3f} px")
+    logger.info(f"Median Pixel Error: {metrics['median']:.3f} px")
     logger.info(f"Per-Corner Mean: TL={metrics['tl']:.2f} | TR={metrics['tr']:.2f} | BR={metrics['br']:.2f} | BL={metrics['bl']:.2f}")
     logger.info("-" * 20)
-    logger.info(f"Patch Recall (64px): {recall['recall_64']:.1f}%")
-    logger.info(f"Patch Recall (80px): {recall['recall_80']:.1f}%")
-    logger.info(f"Patch Recall (96px): {recall['recall_96']:.1f}%")
+    logger.info(f"Patch Box Recall (64px cutoff): {recall['recall_64']:.1f}%")
+    logger.info(f"Patch Box Recall (80px cutoff): {recall['recall_80']:.1f}%")
+    logger.info(f"Patch Box Recall (96px cutoff): {recall['recall_96']:.1f}%")
     logger.info("="*50)
 
     if args.save_csv:

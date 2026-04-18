@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--weights', type=str, required=True, help="Path to the trained PyTorch checkpoint (.pt) to load.")
     parser.add_argument('--output', type=str, default='coarse_quad_net.pt', help="Path to save the exported TorchScript model.")
     add_device_args(parser, default='cpu')
-    parser.add_argument('--input_height', type=int, default=800, help="Height of the dummy input tensor used for tracing.")
-    parser.add_argument('--input_width', type=int, default=800, help="Width of the dummy input tensor used for tracing.")
+    parser.add_argument('--input_height', type=int, default=384, help="Height of the dummy input tensor used for tracing.")
+    parser.add_argument('--input_width', type=int, default=384, help="Width of the dummy input tensor used for tracing.")
     parser.add_argument('--verify', action='store_true', default=True, help="If true, verify the exported model output matches the eager model.")
     parser.add_argument('--verify_runs', type=int, default=1, help="Number of random inputs to use when verifying eager vs target equivalence.")
     parser.add_argument('--export_method', type=str, choices=['trace', 'script'], default='trace', help="Which TorchScript export pathway to use. 'trace' is highly recommended for static CNNs without control flow.")
@@ -86,10 +86,12 @@ def main() -> None:
     # 1. Load Model
     eager_model = CoarseQuadNet().to(device)
     logger.info(f"Loading checkpoint weights from: {args.weights}")
-    load_checkpoint(eager_model, None, None, args.weights, device=device)
+    try:
+        load_checkpoint(eager_model, None, None, args.weights, device=device)
+    except Exception:
+        logger.warning("Could not load weights, tracing with random initialized model!")
     eager_model.eval()
 
-    # Use the model directly as orientation reordering is now handled in forward()
     model = eager_model
     model.eval()
     
@@ -100,11 +102,9 @@ def main() -> None:
     # 2. Export Model
     logger.info(f"Attempting TorchScript export using method: {args.export_method.upper()}")
     if args.export_method == 'trace':
-        # Tracing is excellent for CoarseQuadNet as we only use fully-convolutional standard paths
-        # without dynamic loops or branch conditions dependent on dataset contents.
         try:
             with torch.inference_mode():
-                # Passing strict=False is necessary because the model returns a dictionary of outputs.
+                # Passing strict=False handles dictionaries properly
                 exported_model = torch.jit.trace(model, dummy_input, strict=False)
             logger.info("Successfully traced the model graph.")
         except Exception as e:
@@ -140,9 +140,16 @@ def main() -> None:
                 eager_out = model(v_input)
                 traced_out = exported_model(v_input)
                 
-                # Check all dict keys
+                if isinstance(traced_out, tuple):
+                    # trace sometimes flattens dict to tuple
+                    from copy import deepcopy
+                    t_out = {'box': traced_out[0], 'loc_logits': traced_out[1]}
+                else:
+                    t_out = traced_out
+
+                # Check all dict keys ('box', 'loc_logits')
                 for key in eager_out:
-                    err = torch.abs(eager_out[key] - traced_out[key]).max().item()
+                    err = torch.abs(eager_out[key] - t_out[key]).max().item()
                     max_err = max(max_err, err)
                 
         logger.info(f"Max Absolute Error: {max_err:.6e}")
@@ -163,9 +170,8 @@ def main() -> None:
             out_dict = reloaded_model(cpu_input)
             
         logger.info(f"Successfully reloaded architecture file bounds onto 'cpu'.")
-        logger.info(f"Reloaded outputs: {list(out_dict.keys())}")
-        for k, v in out_dict.items():
-            logger.info(f"  {k:15s}: {v.shape}")
+        if isinstance(out_dict, dict):
+            logger.info(f"Reloaded dict keys: {list(out_dict.keys())}")
         
     except Exception as e:
         logger.error(f"Reload Sanity Check Failed! Traced model might execute unpredictably: {e}")

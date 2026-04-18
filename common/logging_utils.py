@@ -93,37 +93,65 @@ class TrainingTracker:
         
         # Accuracy Metrics
         if metrics:
-            me = metrics.get('mean', 0.0)
-            md = metrics.get('median', 0.0)
-            self.logger.info(f"Pixel Error: Mean: {me:.3f} px | Med: {md:.3f} px")
+            if 'mean_iou' in metrics:
+                # IoU-based metrics (Typical for Coarse / Global Regressor)
+                me = metrics.get('mean_iou', 0.0)
+                md = metrics.get('median_iou', 0.0)
+                self.logger.info(f"IoU Metrics: Mean: {me:.4f} | Med: {md:.4f}")
+                
+                # Handling IoU thresholds (e.g. iou_05, iou_75)
+                iou_keys = sorted([k for k in metrics.keys() if k.startswith('iou_')])
+                items = []
+                for k in iou_keys:
+                    if k in ['mean_iou', 'median_iou']: continue
+                    val = k[4:] # '05' -> '0.5'
+                    label = f"0.{val}" if len(val) == 2 and val.isdigit() else val
+                    if val == '05': label = '0.5'
+                    if val == '75': label = '0.75'
+                    items.append(f"IoU@{label}: {metrics[k]*100:.1f}%")
+                
+                if items:
+                    self.logger.info(f"Precision: {' | '.join(items)}")
             
-            # Per-corner if available
-            if 'tl' in metrics:
-                self.logger.info(f"Per-Corner (Mean): TL: {metrics.get('tl',0):.2f} | TR: {metrics.get('tr',0):.2f} | BR: {metrics.get('br',0):.2f} | BL: {metrics.get('bl',0):.2f}")
-            
-            # Outliers
-            p90 = metrics.get('p90', 0.0)
-            p95 = metrics.get('p95', 0.0)
-            mx = metrics.get('max', 0.0)
-            self.logger.info(f"Outliers: P90: {p90:.2f} | P95: {p95:.2f} | Max: {mx:.2f}")
-            
-            # Thresholds
-            acc_keys = sorted([k for k in metrics.keys() if k.startswith('acc_')])
-            if acc_keys:
-                # Clean up labels for display: acc_2px -> <2px
-                acc_str = " | ".join([f"<{k[4:]}: {metrics[k]:.1f}%" for k in acc_keys])
-                self.logger.info(f"Precision: {acc_str}")
+            elif 'mean' in metrics:
+                # Pixel-based metrics (Typical for Refiner / Keypoints)
+                me = metrics.get('mean', 0.0)
+                md = metrics.get('median', 0.0)
+                self.logger.info(f"Pixel Error: Mean: {me:.3f} px | Med: {md:.3f} px")
+                
+                # Per-corner if available
+                if 'tl' in metrics:
+                    self.logger.info(f"Per-Corner (Mean): TL: {metrics.get('tl',0):.2f} | TR: {metrics.get('tr',0):.2f} | BR: {metrics.get('br',0):.2f} | BL: {metrics.get('bl',0):.2f}")
+                
+                # Outliers
+                p90 = metrics.get('p90', 0.0)
+                p95 = metrics.get('p95', 0.0)
+                mx = metrics.get('max', 0.0)
+                if any(v > 0 for v in [p90, p95, mx]):
+                    self.logger.info(f"Outliers: P90: {p90:.2f} | P95: {p95:.2f} | Max: {mx:.2f}")
+                
+                # Thresholds
+                acc_keys = sorted([k for k in metrics.keys() if k.startswith('acc_')])
+                if acc_keys:
+                    acc_str = " | ".join([f"<{k[4:]}: {metrics[k]:.1f}%" for k in acc_keys])
+                    self.logger.info(f"Precision: {acc_str}")
 
         # Patch Recall
         if recall:
             items = []
             for k in sorted(recall.keys()):
-                label = k[7:] # remove 'recall_'
-                if not label.endswith('px'):
+                val = recall[k]
+                if k == 'recall' and val == 0.0: continue # Skip dummy zero
+                if not isinstance(val, (int, float)) or val <= 0: continue # Skip empty/zero
+                
+                label = k[7:] if k.startswith('recall_') else k
+                if not label.endswith('px') and label.isdigit():
                     label = f"{label}px"
-                items.append(f"{label}: {recall[k]:.1f}%")
-            rec_str = " | ".join(items)
-            self.logger.info(f"Patch Recall: {rec_str}")
+                items.append(f"{label}: {val:.1f}%")
+            
+            if items:
+                rec_str = " | ".join(items)
+                self.logger.info(f"Patch Recall: {rec_str}")
 
 
 class TopLossTracker:

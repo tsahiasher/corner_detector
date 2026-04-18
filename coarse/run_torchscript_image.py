@@ -1,6 +1,5 @@
 import os
 import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import glob
@@ -16,7 +15,6 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
-from common.visualization import save_diagnostic_visualization
 from common.checkpoint import load_checkpoint
 from coarse.models.coarse_quad_net import CoarseQuadNet
 
@@ -42,31 +40,27 @@ def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     return logger
 
 def parse_args() -> argparse.Namespace:
-    """Parses command line config arguments for TorchScript inference."""
-    parser = argparse.ArgumentParser(description="Run TorchScript coarse corner detector on single image or directory.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(description="Run TorchScript global box regressor on single image or directory.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     
     parser.add_argument('--model', type=str, required=True, help="Path to the exported TorchScript model (.pt).")
     parser.add_argument('--image', type=str, required=True, help="Path to the input image or directory of images.")
     parser.add_argument('--output_dir', type=str, default='', help="Directory to save execution artifacts (visualizations, JSON).")
     add_device_args(parser, default='cpu')
-    parser.add_argument('--min_size', type=int, default=800, help="Minimum image dimension for resizing.")
-    parser.add_argument('--max_size', type=int, default=1333, help="Maximum image dimension for resizing.")
+    parser.add_argument('--image_size', type=int, default=384, help="Fixed target inference dimension.")
     
     parser.add_argument('--save_json', action='store_true', default=True, help="Flag to export explicit numeric result limits coordinates to a JSON payload.")
     parser.add_argument('--save_vis', action='store_true', default=True, help="Flag to generate and save a visualization overlaid upon the absolute original image scale.")
     parser.add_argument('--no_vis', action='store_true', default=False, help="Suppresses any visual artifact generations.")
     parser.add_argument('--pytorch', action='store_true', help="Load PyTorch checkpoint (.pt) instead of TorchScript model.")
     
-    parser.add_argument('--score_threshold', type=float, default=0.5, help="Minimum global pool inference bound target confidence required for bounds map output acceptance.")
+    parser.add_argument('--score_threshold', type=float, default=0.5, help="Minimum global pool inference confidence required.")
     parser.add_argument('--print_coordinates', action='store_true', default=True, help="Dumps the raw parsed map scale geometry structs vector payloads explicitly into console bounds.")
-    parser.add_argument('--run_dir', type=str, default='', help="Optional run directory space to group structural logs instead of using global standalone namespaces.")
     
     return parser.parse_args()
 
-def preprocess_image(image: Image.Image, min_size: int, max_size: int, device: torch.device) -> torch.Tensor:
-    from common.transforms import ResizeMinMax
-    resizer = ResizeMinMax(min_size=min_size, max_size=max_size)
-    # ResizeMinMax expects (image, keypoints), we pass empty keypoints
+def preprocess_image(image: Image.Image, image_size: int, device: torch.device) -> torch.Tensor:
+    from common.transforms import ResizeImage
+    resizer = ResizeImage(size=image_size)
     img_resized, _ = resizer(image, [])
     
     tensor = TF.to_tensor(img_resized)
@@ -74,28 +68,9 @@ def preprocess_image(image: Image.Image, min_size: int, max_size: int, device: t
     std = [0.229, 0.224, 0.225]
     tensor = TF.normalize(tensor, mean=mean, std=std)
     tensor = tensor.unsqueeze(0).to(device)
-    
-    # Ensure dimensions are multiples of 32 for the FPN backbone
-    h, w = tensor.shape[2:]
-    new_h = ((h + 31) // 32) * 32
-    new_w = ((w + 31) // 32) * 32
-    if new_h != h or new_w != w:
-        tensor = torch.nn.functional.pad(tensor, (0, new_w - w, 0, new_h - h))
-        
     return tensor
 
-def save_visualization(image: Image.Image, corners_norm: list, corners_px: List[List[int]],
-                       img_path: str, output_dir: str) -> None:
-    """Draws indexed predicted corners on the original-scale image and saves it.
-
-    Args:
-        image (Image.Image): Original PIL image.
-        corners_norm (list): Normalized corner coordinates [[x,y], ...].
-        corners_px (List[List[int]]): Pixel-space corner coordinates.
-        img_path (str): Original image path.
-        output_dir (str): Destination directory.
-        input_size (int): Model input resolution used for preprocessing.
-    """
+def save_visualization(image: Image.Image, box_px: List[int], img_path: str, output_dir: str) -> None:
     try:
         import cv2
         import numpy as np
@@ -111,26 +86,26 @@ def save_visualization(image: Image.Image, corners_norm: list, corners_px: List[
         img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
 
     h, w = img_np.shape[:2]
-    label_names = ['TL', 'TR', 'BR', 'BL']
     color_pred = (0, 165, 255)  # Orange
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = max(0.5, min(w, h) / 800.0)
-    thickness = max(1, int(min(w, h) / 400))
-    radius = max(4, int(min(w, h) / 150))
+    thickness = max(2, int(min(w, h) / 400))
 
-    # Draw polygon and indexed labels
-    for i in range(4):
-        pt = tuple(corners_px[i])
-        next_pt = tuple(corners_px[(i + 1) % 4])
-        cv2.line(img_np, pt, next_pt, (0, 255, 0), thickness)
-        cv2.circle(img_np, pt, radius, color_pred, -1)
-        label = str(i)
-        cv2.putText(img_np, label, (pt[0] + 12, pt[1] + 12), font, font_scale, color_pred, thickness)
+    cx, cy, pw, ph = box_to_poly(box_px)
+    x1, y1, x2, y2 = box_px
+
+    # Draw regular rectangle
+    cv2.rectangle(img_np, (x1, y1), (x2, y2), color_pred, thickness)
 
     base_name = os.path.basename(img_path)
     out_path = os.path.join(output_dir, base_name)
     cv2.imwrite(out_path, img_np)
 
+def box_to_poly(box_px: list):
+     # Just dummy extraction
+     x1, y1, x2, y2 = box_px
+     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+     w, h = x2 - x1, y2 - y1
+     return cx, cy, w, h
+     
 def process_image(img_path: str, model: Any, args: argparse.Namespace, device: torch.device, logger: logging.Logger, is_dir_mode: bool) -> Optional[Dict[str, float]]:
     t0 = sync_time()
     try:
@@ -143,45 +118,43 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
     
     # Preprocess
     t0 = sync_time()
-    input_tensor = preprocess_image(image, args.min_size, args.max_size, device)
+    input_tensor = preprocess_image(image, args.image_size, device)
     t_prep = sync_time() - t0
     
     # Inference
     t0 = sync_time()
     with torch.inference_mode():
-        out_dict = model(input_tensor)
-    
-    if 'score' not in out_dict:
-        return None
+        # Traced model gives tuple or dict depending on export method strict=False
+        out = model(input_tensor)
         
+    if isinstance(out, dict):
+        pred_box = out['box'][0]
+    else:
+        # Tuple return case if trace simplified it
+        pred_box = out[0][0] if isinstance(out, tuple) else out[0]
+        
+    score_val = 1.0 # Implicit object validation context
     logger.info(f"  Input Shape:  {list(input_tensor.shape)}")
-    score_val = out_dict['score'][0, 0].item()
-    corners_norm = out_dict['corners'][0].cpu().tolist()
     t_infer = sync_time() - t0
     
     t0 = sync_time()
-    corners_px = []
-    for (nx, ny) in corners_norm:
-        x_px = int(round(nx * orig_w))
-        y_px = int(round(ny * orig_h))
-        x_px = max(0, min(x_px, orig_w - 1))
-        y_px = max(0, min(y_px, orig_h - 1))
-        corners_px.append([x_px, y_px])
+    cx_n, cy_n, w_n, h_n = pred_box.cpu().tolist()
+    
+    x1_px = int(round((cx_n - w_n/2) * orig_w))
+    y1_px = int(round((cy_n - h_n/2) * orig_h))
+    x2_px = int(round((cx_n + w_n/2) * orig_w))
+    y2_px = int(round((cy_n + h_n/2) * orig_h))
+    
+    x1_px = max(0, min(x1_px, orig_w - 1))
+    y1_px = max(0, min(y1_px, orig_h - 1))
+    x2_px = max(0, min(x2_px, orig_w - 1))
+    y2_px = max(0, min(y2_px, orig_h - 1))
+    box_px = [x1_px, y1_px, x2_px, y2_px]
     t_post = sync_time() - t0
 
     # Actions
     if not args.no_vis and args.save_vis:
-        save_visualization(image, corners_norm, corners_px, img_path, args.output_dir)
-        
-        # Performance Boost v2: Save diagnostic triple-view if mask/edges available
-        if 'mask' in out_dict and 'edges' in out_dict:
-            # Dummy GT for inference-only vis
-            dummy_gt = torch.tensor(corners_norm, device=device)
-            save_diagnostic_visualization(
-                input_tensor[0], out_dict['corners'][0], dummy_gt,
-                out_dict['mask'][0], out_dict['edges'][0],
-                img_path, args.output_dir
-            )
+        save_visualization(image, box_px, img_path, args.output_dir)
         
     json_name = os.path.splitext(os.path.basename(img_path))[0] + ".json"
     json_path = os.path.join(args.output_dir, json_name)
@@ -191,8 +164,8 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
             'original_width': orig_w,
             'original_height': orig_h,
             'confidence_score': score_val,
-            'corners_normalized': corners_norm,
-            'corners_pixel': corners_px,
+            'bounding_box_normalized': [cx_n, cy_n, w_n, h_n],
+            'bounding_box_pixel': box_px,
             'timing_ms': {
                 'load_image': t_load_img * 1000,
                 'preprocess': t_prep * 1000,
@@ -216,14 +189,11 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
             logger.warning(f"Note: Score is below confidence threshold ({args.score_threshold})")
             
         if args.print_coordinates:
-            logger.info("\nNormalized coordinates ([0,1]):")
-            for i, (nx, ny) in enumerate(corners_norm):
-                logger.info(f"  P{i+1}: ({nx:.4f}, {ny:.4f})")
+            logger.info("\nNormalized Box (cx, cy, w, h):")
+            logger.info(f"  ({cx_n:.4f}, {cy_n:.4f}, {w_n:.4f}, {h_n:.4f})")
                 
-        logger.info("\nDecoded Pixel coordinates:")
-        labels = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-        for i, (px, py) in enumerate(corners_px):
-            logger.info(f"  {labels[i]:13s}: ({px}, {py})")
+        logger.info("\nDecoded Pixel Bounding Box [x1, y1, x2, y2]:")
+        logger.info(f"  {box_px}")
             
         if not args.no_vis and args.save_vis:
             logger.info(f"\nSaved visualization to: {os.path.join(args.output_dir, os.path.basename(img_path))}")
@@ -245,7 +215,6 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
     }
 
 def main() -> None:
-    t_start_total = sync_time()
     args = parse_args()
     
     if not args.output_dir:

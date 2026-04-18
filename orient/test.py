@@ -13,7 +13,7 @@ from orient.datasets.orient_dataset import OrientDataset
 from common.checkpoint import load_checkpoint
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device
 
-ORIENT_LABELS = {0: '  0°', 1: ' 90°', 2: '180°', 3: '270°'}
+ORIENT_LABELS = {0: '  0 Deg', 1: ' 90 Deg', 2: '180 Deg', 3: '270 Deg'}
 
 
 def setup_logging() -> logging.Logger:

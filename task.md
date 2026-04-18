@@ -1,54 +1,62 @@
-## 1) Network 1 — Coarse corner detector
+## 1) Stage 1 — Coarse Corner Detector
 
-**Purpose:** quickly find approximate 4 corners on the full image
+**Purpose:** Rapidly localize 4 corners on the full image.
 
-* Architecture: tiny CNN (MobileNet-style, depthwise separable convs)
-* Input: ~384×384 image
-* Output: 4 corner coordinates
-
-**Size:**
-
-* ~0.5M – 1M parameters (very small)
-* Runs fast because it downsamples aggressively
+* **Architecture**: YOLO-Pose style (ResNet-18 + FPN + Dense Head)
+* **Input**: 384×384 image
+* **Output**: Bounding box + 4 corners + Confidence scores
+* **Size**: ~11.5M parameters
 
 ---
 
-## 2) Network 2 — Corner refiner (shared)
+## 2) Stage 1.5 — Orientation Classifier (OrientNet)
 
-**Purpose:** get **sub-pixel accurate corner** from small patches
+**Purpose**: Classify card rotation (0/90/180/270) to ensure consistent physical corner identity.
 
-* Architecture: very small U-Net–like CNN
-* Input: 64×64 patch (one corner at a time)
-* Output: heatmap + offset
-
-**Size:**
-
-* ~0.2M – 0.5M parameters
-* Same network reused 4 times (not 4 separate models)
+* **Architecture**: MobileNet-style classifier
+* **Input**: 128×128 rectified card crop
+* **Output**: Rotation class (4-way)
+* **Size**: ~0.05M parameters
 
 ---
 
-## Total model size
+## 3) Stage 2 — Corner Refiner (Iterative Refiner)
 
-* Combined: **~0.7M – 1.5M parameters**
-* This is **orders of magnitude smaller** than ResNet50 (~25M)
+**Purpose**: Achieve sub-pixel accuracy using differentiable zoom.
 
+* **Architecture**: Two-stage iterative network (Global + Local Zoom + Fine Head)
+* **Input**: 96×96 corner patches
+* **Output**: High-precision sub-pixel offsets via `SoftArgmax2D`
+* **Size**: ~0.5M parameters
+* Same network reused 4 times (one per corner)
 
-## Scripts
-python coarse\train.py --epochs 50 --batch_size 480
+---
 
-python coarse\test.py --weights coarse\runs\20260321_194732\checkpoints\best.pt
+## Training Commands
 
-python coarse\export_torchscript.py --weights coarse\runs\20260321_194732\checkpoints\best.pt --output coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt
+### Stage 1: Coarse
+```bash
+python coarse/train.py --epochs 100 --batch_size 32 --mine_hard
+python coarse/test.py --weights coarse/runs/latest/checkpoints/best.pt
+python coarse/export_torchscript.py --weights coarse/runs/latest/checkpoints/best.pt
+```
 
-python coarse\run_torchscript_image.py --model coarse\runs\20260413_145547\checkpoints\coarse_quad_net.pt --image your_id_card.jpg
+### Stage 1.5: Orientation
+```bash
+python orient/train.py --epochs 30 --batch_size 64
+python orient/test.py --weights orient/runs/latest/checkpoints/best.pt
+```
 
-python refiner\train.py --epochs 50 --batch_size 480
+### Stage 2: Refiner
+```bash
+python refiner/train.py --epochs 50 --batch_size 128
+python refiner/test.py --weights refiner/runs/latest/checkpoints/best.pt
+```
 
-python refiner\test.py --weights refiner\runs\20260322_023415\checkpoints\best.pt
-
-python refiner\export_torchscript.py --weights refiner\runs\20260322_023415\checkpoints\best.pt --output refiner\runs\20260322_023415\checkpoints\patch_refiner.pt
-
-python refiner\run_torchscript_image.py --model refiner\runs\20260322_023415\checkpoints\patch_refiner.pt --image ..\test_images\001.jpg --coarse_results coarse\runs\20260321_194732\inference_outputs
-
-corner_detector>python run_torchscript_image.py --coarse_mode coarse\runs\20260321_194732\checkpoints\coarse_quad_net.pt --refiner_model refiner\runs\20260322_023415\checkpoints\patch_refiner.pt --input ..\test_images\001.jpg
+### Full Pipeline Inference
+```bash
+python run_torchscript_image.py \
+    --coarse_model coarse/runs/latest/checkpoints/coarse_quad_net.pt \
+    --refiner_model refiner/runs/latest/checkpoints/patch_refiner.pt \
+    --input your_image.jpg
+```

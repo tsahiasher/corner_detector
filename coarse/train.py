@@ -16,13 +16,8 @@ from coarse.datasets.yolo_keypoint_dataset import YOLOKeypointDataset, collate_f
 from coarse.datasets.coco_val_dataset import COCOValDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
-from common.metrics import (calculate_accuracy_metrics, compute_patch_recall,
-                            YOLOPoseLoss)
-from common.geometry import sort_corners_clockwise
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
-from common.logging_utils import TrainingTracker, TopLossTracker, HardExampleMiner
-from common.visualization import save_diagnostic_visualization
-from torch.utils.data import WeightedRandomSampler
+from common.logging_utils import TrainingTracker
 
 
 def setup_logging(log_file: str) -> logging.Logger:
@@ -43,35 +38,106 @@ def setup_logging(log_file: str) -> logging.Logger:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Structured Coarse Quad Net (Stage 1).")
+    parser = argparse.ArgumentParser(description="Train Spatially Aware Regressor (Stage 1).")
     parser.add_argument('--train_images', type=str, default='../crop-dataset-eitan-yolo/images/train', help="Path to training images.")
     parser.add_argument('--val_images', type=str, default='../crop-dataset-eitan-yolo/images/val', help="Path to validation images.")
     parser.add_argument('--val_json', type=str, default='../crop-dataset-eitan-yolo/annotations/val.json', help="Path to validation COCO JSON.")
     parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs.")
     parser.add_argument('--batch_size', type=int, default=16, help="Training batch size.")
-    parser.add_argument('--min_size', type=int, default=800, help="Minimum image dimension.")
-    parser.add_argument('--max_size', type=int, default=1333, help="Maximum image dimension.")
+    parser.add_argument('--image_size', type=int, default=384, help="Fixed square input size.")
     parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate.")
     parser.add_argument('--runs_dir', type=str, default='./coarse/runs', help="Base directory for training runs.")
-    parser.add_argument('--name', type=str, default='', help="Optional suffix for the run directory.")
+    parser.add_argument('--name', type=str, default='bounding_box', help="Optional suffix for the run directory.")
     parser.add_argument('--resume', type=str, default='', help="Path to checkpoint to resume from.")
     
     # Performance
     parser.add_argument('--num_workers', type=int, default=4, help="Number of dataloader workers.")
-    parser.add_argument('--pin_memory', action='store_true', default=True, help="Use pinned memory for faster GPU transfer.")
+    parser.add_argument('--pin_memory', action=argparse.BooleanOptionalAction, default=True, help="Use pinned memory for faster GPU transfer.")
     parser.add_argument('--grad_clip', type=float, default=1.0, help="Gradient clipping value (0 to disable).")
     
-    # YOLO-Pose Loss Weights
-    parser.add_argument('--w_obj', type=float, default=1.0, help='Objectness (focal) loss weight.')
-    parser.add_argument('--w_box', type=float, default=5.0, help='CIoU bounding-box loss weight.')
-    parser.add_argument('--w_kpt', type=float, default=10.0, help='Keypoint regression loss weight.')
-
-    # Mining
-    parser.add_argument('--mine_hard', action='store_true', default=True, help="Enable hard example mining.")
-    parser.add_argument('--mine_exponent', type=float, default=1.5, help="Aggressiveness of hard mining (weight = error ^ exponent).")
+    # Loss Weights
+    parser.add_argument('--w_box', type=float, default=1.0, help='SmoothL1 bounding-box loss weight.')
+    parser.add_argument('--w_giou', type=float, default=1.0, help='Generalized IoU bounding-box loss weight.')
+    parser.add_argument('--w_sub', type=float, default=0.3, help='Penalizes confident sub-region enclosures.')
+    parser.add_argument('--w_size', type=float, default=0.05, help='Direct unidirectional dimensionality prior explicitly punishing smaller bounds.')
+    parser.add_argument('--gt_pad', type=float, default=0.05, help='Padding extension margin implicitly expanded around native dataset coordinates.')
+    parser.add_argument('--w_loc', type=float, default=1.0, help='Weight for spatial soft-attention localization mask loss.')
 
     add_device_args(parser, default='auto')
     return parser.parse_args()
+
+
+def calculate_iou_components(pred_box, gt_box):
+    """Calculates internal bounding configurations, IoU and GIoU bounds inline."""
+    # box format: cx, cy, w, h
+    px1 = pred_box[:, 0] - pred_box[:, 2] / 2
+    py1 = pred_box[:, 1] - pred_box[:, 3] / 2
+    px2 = pred_box[:, 0] + pred_box[:, 2] / 2
+    py2 = pred_box[:, 1] + pred_box[:, 3] / 2
+    
+    gx1 = gt_box[:, 0] - gt_box[:, 2] / 2
+    gy1 = gt_box[:, 1] - gt_box[:, 3] / 2
+    gx2 = gt_box[:, 0] + gt_box[:, 2] / 2
+    gy2 = gt_box[:, 1] + gt_box[:, 3] / 2
+
+    # Intersect Area
+    ix1 = torch.max(px1, gx1)
+    iy1 = torch.max(py1, gy1)
+    ix2 = torch.min(px2, gx2)
+    iy2 = torch.min(py2, gy2)
+    inter_w = (ix2 - ix1).clamp(min=0)
+    inter_h = (iy2 - iy1).clamp(min=0)
+    inter = inter_w * inter_h
+
+    # Union Area
+    area_pred = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
+    area_gt = (gx2 - gx1).clamp(min=0) * (gy2 - gy1).clamp(min=0)
+    union = area_pred + area_gt - inter + 1e-6
+    iou = inter / union
+
+    # Convex Hull Area (Smallest Enclosing Box)
+    cx1 = torch.min(px1, gx1)
+    cy1 = torch.min(py1, gy1)
+    cx2 = torch.max(px2, gx2)
+    cy2 = torch.max(py2, gy2)
+    c_area = (cx2 - cx1).clamp(min=0) * (cy2 - cy1).clamp(min=0) + 1e-6
+    
+    giou = iou - (c_area - union) / c_area
+    giou_loss = 1.0 - giou
+
+    return iou, giou_loss, inter, area_pred, area_gt
+
+def draw_diagnostic_boxes(image_t, pred_box, gt_box, path, out_dir):
+    try:
+        import os
+        import cv2
+        import numpy as np
+        from common.transforms import denormalize_image
+    except ImportError:
+        return
+
+    # Original Image
+    img = denormalize_image(image_t.cpu()).permute(1, 2, 0).numpy()
+    img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    h, w = img.shape[:2]
+
+    def box_to_poly(b, ww, hh):
+        cx, cy, bw, bh = b
+        x1, y1 = int((cx - bw/2) * ww), int((cy - bh/2) * hh)
+        x2, y2 = int((cx + bw/2) * ww), int((cy + bh/2) * hh)
+        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
+
+    gt_px = box_to_poly(gt_box, w, h)
+    cv2.polylines(img, [gt_px], True, (255, 0, 0), 2)  # Blue = GT
+
+    if pred_box is not None:
+        pred_px = box_to_poly(pred_box, w, h)
+        cv2.polylines(img, [pred_px], True, (0, 165, 255), 2)  # Orange = Pred
+
+    name = os.path.basename(path)
+    os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(out_dir, f"diag_{name}"), img)
 
 
 def main() -> None:
@@ -89,7 +155,6 @@ def main() -> None:
 
     logger = setup_logging(os.path.join(run_dir, 'logs', 'train.log'))
     logger.info(f"Run directory: {run_dir}")
-    logger.info(f"YOLO-Pose Losses: Obj={args.w_obj}, Box={args.w_box}, Kpt={args.w_kpt}")
     
     tracker = TrainingTracker(logger)
     set_seed(42)
@@ -101,39 +166,34 @@ def main() -> None:
         args.num_workers = 0
 
     logger.info("Initializing datasets...")
-    train_dataset = YOLOKeypointDataset(args.train_images, image_size=None, min_size=args.min_size, max_size=args.max_size, is_train=True)
-    # COCO might need updates if not dynamic, using YOLO for both typically, but the original code used COCOValDataset
-    # We will pass min_size and max_size to COCOValDataset as well (we need to update COCOValDataset to accept these)
-    val_dataset = COCOValDataset(args.val_images, args.val_json, image_size=None, min_size=args.min_size, max_size=args.max_size)
+    # is_train=False suppresses arbitrary dynamic scaling and rotations. Pure mapping only.
+    train_dataset = YOLOKeypointDataset(args.train_images, image_size=args.image_size, min_size=None, max_size=None, is_train=False)
+    val_dataset = COCOValDataset(args.val_images, args.val_json, image_size=args.image_size, min_size=None, max_size=None)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
                               num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
-
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
                             num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
 
     model = CoarseQuadNet().to(device)
     param_count = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model: YOLO-Pose CoarseQuadNet | Parameters: {param_count:,}")
+    logger.info(f"Model: Spatially-Aware Regressor | Parameters: {param_count:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # YOLO-Pose unified loss (objectness + CIoU box + keypoint)
-    criterion = YOLOPoseLoss(w_obj=args.w_obj, w_box=args.w_box, w_kpt=args.w_kpt)
+    criterion_box = nn.SmoothL1Loss(reduction='mean')
+    criterion_loc = nn.BCEWithLogitsLoss(reduction='mean')
 
     start_epoch = 0
-    best_mean_error = float('inf')
-    best_recall_96 = 0.0
+    best_mean_iou = 0.0
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
         checkpoint = load_checkpoint(model, optimizer, scheduler, args.resume, device=device)
         if checkpoint:
             start_epoch = checkpoint.get('epoch', 0)
-            best_recall_96 = checkpoint.get('best_metric', 0.0)
-            logger.info(f"Restored checkpoint at epoch {start_epoch} (best recall: {best_recall_96:.2f})")
-
-    miner = HardExampleMiner(len(train_loader.dataset))
+            best_mean_iou = checkpoint.get('best_metric', 0.0)
+            logger.info(f"Restored checkpoint at epoch {start_epoch} (best IoU: {best_mean_iou:.4f})")
     
     global_start_time = sync_time()
     for epoch in range(start_epoch, args.epochs):
@@ -144,31 +204,81 @@ def main() -> None:
         model.train()
         tracker.start_train_phase()
         
-        # Dynamic Aggressiveness
-        current_exponent = 1.0 + (args.mine_exponent - 1.0) * (epoch / max(1, args.epochs - 1))
-        
-        if args.mine_hard and epoch >= 10:
-            weights = miner.get_weights(exponent=current_exponent)
-            sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset), replacement=True)
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler,
-                                      num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
-            logger.info(f"Epoch {epoch+1}: Recreated train_loader (Mining Exp: {current_exponent:.2f}).")
-
         train_pbar = tqdm(train_loader, desc=f"Train Epoch {epoch+1}", leave=False)
         for batch in train_pbar:
             batch_start = sync_time()
             batch = move_batch_to_device(batch, device)
             optimizer.zero_grad()
             
-            out = model(batch['image'])
-            gt_corners = batch['corners']
+            # Forward pass
+            out_dict = model(batch['image'])
+            pred_box = out_dict['box'] # [B, 4]
+            loc_logits = out_dict['loc_logits'] # [B, 1, H, W]
             
-            # --- Dynamic Corner Sorting (Physical to Visual) ---
-            gt_corners_visual = sort_corners_clockwise(gt_corners)
+            # Ground truth targets
+            gt_corners = batch['corners'] # [B, 4, 2]
+            gx_min = gt_corners[:, :, 0].min(1).values
+            gy_min = gt_corners[:, :, 1].min(1).values
+            gx_max = gt_corners[:, :, 0].max(1).values
+            gy_max = gt_corners[:, :, 1].max(1).values
             
-            # YOLO-Pose unified loss
-            losses = criterion(out['raw_pred'], gt_corners_visual)
-            total_loss = losses['total']
+            gt_cx = (gx_min + gx_max) / 2
+            gt_cy = (gy_min + gy_max) / 2
+            gt_w = (gx_max - gx_min).clamp(min=1e-6)
+            gt_h = (gy_max - gy_min).clamp(min=1e-6)
+            
+            # Sub-Region Fix: Expand box natively by padding prior to boundaries constraints
+            raw_gt_w = gt_w * (1.0 + args.gt_pad)
+            raw_gt_h = gt_h * (1.0 + args.gt_pad)
+            nx1 = (gt_cx - raw_gt_w / 2).clamp(min=0.0, max=1.0)
+            ny1 = (gt_cy - raw_gt_h / 2).clamp(min=0.0, max=1.0)
+            nx2 = (gt_cx + raw_gt_w / 2).clamp(min=0.0, max=1.0)
+            ny2 = (gt_cy + raw_gt_h / 2).clamp(min=0.0, max=1.0)
+            
+            p_cx = (nx1 + nx2) / 2
+            p_cy = (ny1 + ny2) / 2
+            p_w = (nx2 - nx1).clamp(min=1e-6)
+            p_h = (ny2 - ny1).clamp(min=1e-6)
+            gt_box = torch.stack([p_cx, p_cy, p_w, p_h], dim=1)
+            
+            # Localization Mask Bounds
+            B_b, _, H, W = loc_logits.size()
+            y_grid = torch.arange(H, device=device).view(-1, 1).float() + 0.5
+            x_grid = torch.arange(W, device=device).view(1, -1).float() + 0.5
+            y_norm = y_grid / H
+            x_norm = x_grid / W
+
+            loc_target = torch.zeros_like(loc_logits)
+            for B_idx in range(B_b):
+                in_x = (x_norm >= nx1[B_idx]) & (x_norm <= nx2[B_idx])
+                in_y = (y_norm >= ny1[B_idx]) & (y_norm <= ny2[B_idx])
+                loc_target[B_idx, 0] = (in_y * in_x).float()
+            
+            # Losses
+            loss_l1 = criterion_box(pred_box, gt_box) * args.w_box
+            _, giou_l, inter, area_pred, area_gt = calculate_iou_components(pred_box, gt_box)
+            loss_giou = giou_l.mean() * args.w_giou
+            loss_loc = criterion_loc(loc_logits, loc_target) * args.w_loc
+            
+            # Sub-Region Check: active strictly when network safely isolates a small dense subsection perfectly enclosed natively.
+            inside_ratio = inter / (area_pred + 1e-6)
+            size_ratio = area_pred / (area_gt + 1e-6)
+
+            inside_mask = (inside_ratio > 0.9).float()
+            small_mask = (size_ratio < 0.75).float()
+
+            sub_penalty = inside_mask * small_mask * (1.0 - size_ratio)
+            sub_loss_val = sub_penalty.mean() * args.w_sub
+
+            # Unidirectional Target Dimensionality Bounds explicitly pushing geometry larger if deficient
+            width_ratio = pred_box[:, 2] / (gt_box[:, 2] + 1e-6)
+            height_ratio = pred_box[:, 3] / (gt_box[:, 3] + 1e-6)
+
+            width_small = torch.nn.functional.relu(0.85 - width_ratio)
+            height_small = torch.nn.functional.relu(0.85 - height_ratio)
+
+            size_loss_val = (width_small + height_small).mean() * args.w_size
+            total_loss = loss_l1 + loss_giou + sub_loss_val + size_loss_val + loss_loc
             
             total_loss.backward()
             if args.grad_clip > 0:
@@ -177,187 +287,168 @@ def main() -> None:
 
             # Detailed component logging
             components = {
-                'obj': losses['obj'].item(),
-                'box': losses['box'].item(),
-                'kpt': losses['kpt'].item(),
+                'box_l1': loss_l1.item(),
+                'box_giou': loss_giou.item(),
+                'box_sub': sub_loss_val.item(),
+                'box_size': size_loss_val.item(),
+                'loc_bce': loss_loc.item()
             }
             tracker.record_batch('train', total_loss.item(), sync_time() - batch_start, components=components)
             train_pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
             
-            # Update Miner with per-sample errors (Pixel space)
-            with torch.no_grad():
-                # Get the actual padded width/height used for offsets
-                B_idx_temp = batch['image'].size(0)
-                pad_h = torch.tensor(batch['image'].shape[2], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
-                pad_w = torch.tensor(batch['image'].shape[3], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
-                
-                scaled_w = batch.get('scaled_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                orig_w = batch.get('orig_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                ratio_w = orig_w / scaled_w
-
-                scaled_h = batch.get('scaled_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                orig_h = batch.get('orig_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                ratio_h = orig_h / scaled_h
-                
-                # Use geometric visual corners for geometric mining
-                diff = (out['corners_visual'] - gt_corners_visual).abs()
-                diff[:, :, 0] *= (pad_w * ratio_w)
-                diff[:, :, 1] *= (pad_h * ratio_h)
-                
-                # Mining: Worst-corner prioritization
-                dist_max = torch.norm(diff, dim=-1).max(dim=-1)[0] # max error per image [B]
-                
-                weights = []
-                for b_idx in range(gt_corners.size(0)):
-                    d = dist_max[b_idx].item()
-                    w = d
-                    if d > 48.0:
-                        w *= 5.0 # heavily penalize corners falling outside the 96px capture box
-                    weights.append(w)
-                miner.update(batch['index'].tolist(), weights)
-
-            del out, batch, total_loss, components, losses
-
         tracker.end_train_phase()
         torch.cuda.empty_cache()
 
         # === Validation ===
         model.eval()
         tracker.start_val_phase()
-        all_errs = []
+        
+        all_iou = []
         all_vis_data = []        
+        
         val_pbar = tqdm(val_loader, desc=f"Val Epoch {epoch+1}", leave=False)
         with torch.inference_mode():
             for batch in val_pbar:
                 batch_start = sync_time()
                 batch = move_batch_to_device(batch, device)
-                out = model(batch['image'])
+                
+                # Forward pass
+                out_dict = model(batch['image'])
+                pred_box = out_dict['box'] # [B, 4]
+                loc_logits = out_dict['loc_logits']
+                
+                # Ground truth targets
                 gt_corners = batch['corners']
+                gx_min = gt_corners[:, :, 0].min(1).values
+                gy_min = gt_corners[:, :, 1].min(1).values
+                gx_max = gt_corners[:, :, 0].max(1).values
+                gy_max = gt_corners[:, :, 1].max(1).values
                 
-                # --- Dynamic Corner Sorting (Physical to Visual) ---
-                gt_corners_visual = sort_corners_clockwise(gt_corners)
+                gt_cx = (gx_min + gx_max) / 2
+                gt_cy = (gy_min + gy_max) / 2
+                gt_w = (gx_max - gx_min).clamp(min=1e-6)
+                gt_h = (gy_max - gy_min).clamp(min=1e-6)
                 
-                # YOLO-Pose unified loss
-                losses = criterion(out['raw_pred'], gt_corners_visual)
-                val_total_loss = losses['total']
+                # Sub-Region Fix: Expand box natively by padding prior to boundaries constraints
+                raw_gt_w = gt_w * (1.0 + args.gt_pad)
+                raw_gt_h = gt_h * (1.0 + args.gt_pad)
+                nx1 = (gt_cx - raw_gt_w / 2).clamp(min=0.0, max=1.0)
+                ny1 = (gt_cy - raw_gt_h / 2).clamp(min=0.0, max=1.0)
+                nx2 = (gt_cx + raw_gt_w / 2).clamp(min=0.0, max=1.0)
+                ny2 = (gt_cy + raw_gt_h / 2).clamp(min=0.0, max=1.0)
+                
+                p_cx = (nx1 + nx2) / 2
+                p_cy = (ny1 + ny2) / 2
+                p_w = (nx2 - nx1).clamp(min=1e-6)
+                p_h = (ny2 - ny1).clamp(min=1e-6)
+                gt_box = torch.stack([p_cx, p_cy, p_w, p_h], dim=1)
+                
+                # Localization Mask Bounds
+                B_b, _, H, W = loc_logits.size()
+                y_grid = torch.arange(H, device=device).view(-1, 1).float() + 0.5
+                x_grid = torch.arange(W, device=device).view(1, -1).float() + 0.5
+                y_norm = y_grid / H
+                x_norm = x_grid / W
+
+                loc_target = torch.zeros_like(loc_logits)
+                for B_idx in range(B_b):
+                    in_x = (x_norm >= nx1[B_idx]) & (x_norm <= nx2[B_idx])
+                    in_y = (y_norm >= ny1[B_idx]) & (y_norm <= ny2[B_idx])
+                    loc_target[B_idx, 0] = (in_y * in_x).float()
+                
+                loss_l1 = criterion_box(pred_box, gt_box) * args.w_box
+                iou, giou_l, inter, area_pred, area_gt = calculate_iou_components(pred_box, gt_box)
+                loss_giou = giou_l.mean() * args.w_giou
+                loss_loc = criterion_loc(loc_logits, loc_target) * args.w_loc
+                
+                inside_ratio = inter / (area_pred + 1e-6)
+                size_ratio = area_pred / (area_gt + 1e-6)
+
+                inside_mask = (inside_ratio > 0.9).float()
+                small_mask = (size_ratio < 0.75).float()
+
+                sub_penalty = inside_mask * small_mask * (1.0 - size_ratio)
+                sub_loss_val = sub_penalty.mean() * args.w_sub
+                width_ratio = pred_box[:, 2] / (gt_box[:, 2] + 1e-6)
+                height_ratio = pred_box[:, 3] / (gt_box[:, 3] + 1e-6)
+
+                width_small = torch.nn.functional.relu(0.85 - width_ratio)
+                height_small = torch.nn.functional.relu(0.85 - height_ratio)
+
+                size_loss_val = (width_small + height_small).mean() * args.w_size
+                val_loss = loss_l1 + loss_giou + sub_loss_val + size_loss_val + loss_loc
                 
                 components = {
-                    'obj': losses['obj'].item(),
-                    'box': losses['box'].item(),
-                    'kpt': losses['kpt'].item(),
+                    'box_l1': loss_l1.item(),
+                    'box_giou': loss_giou.item(),
+                    'box_sub': sub_loss_val.item(),
+                    'box_size': size_loss_val.item(),
+                    'loc_bce': loss_loc.item()
                 }
-                tracker.record_batch('val', val_total_loss.item(), sync_time() - batch_start, components=components)
-
-                # Accuracy (Pixel Space)
-                # Compute absolute pixel error on the padded grid shape to match predicted scale
-                B_idx_temp = out['corners'].size(0)
-                pad_h = torch.tensor(batch['image'].shape[2], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
-                pad_w = torch.tensor(batch['image'].shape[3], device=device).float().view(-1, 1).expand(B_idx_temp, 1)
-
-                scaled_w = batch.get('scaled_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                orig_w = batch.get('orig_width', pad_w[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                ratio_w = orig_w / scaled_w
-
-                scaled_h = batch.get('scaled_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                orig_h = batch.get('orig_height', pad_h[:,0]).to(device).view(-1, 1).expand(B_idx_temp, 1)
-                ratio_h = orig_h / scaled_h
-
-                diff = (out['corners'] - gt_corners_visual).abs()
-                diff[:, :, 0] *= (pad_w * ratio_w)
-                diff[:, :, 1] *= (pad_h * ratio_h)
-                dist = torch.norm(diff, dim=-1) # [B, 4]
-                all_errs.append(dist.cpu())
+                tracker.record_batch('val', val_loss.item(), sync_time() - batch_start, components=components)
+                all_iou.append(iou.cpu())
                 
-                # Store metadata for all samples (without the 20MB image tensor)
-                m_dist = dist.mean(dim=-1)
                 for b_idx in range(batch['image'].size(0)):
                     all_vis_data.append({
-                        'err': m_dist[b_idx].item(),
-                        'pred': out['corners'][b_idx].cpu(),
-                        'gt': gt_corners_visual[b_idx].cpu(),
+                        'iou': iou[b_idx].item(),
+                        'pred_box': pred_box[b_idx].cpu().numpy(),
+                        'gt_box': gt_box[b_idx].cpu().numpy(),
                         'path': batch['img_path'][b_idx],
-                        'pad_w': pad_w[b_idx].item(),
-                        'pad_h': pad_h[b_idx].item()
                     })
-                
-                # Explicitly free variables
-                del out, batch, components, losses
 
         tracker.end_val_phase()
         torch.cuda.empty_cache()
 
         # Metrics
-        errors = torch.cat(all_errs, dim=0)
-        metrics = calculate_accuracy_metrics(errors)
-        recall_val = compute_patch_recall(errors)
+        ious = torch.cat(all_iou, dim=0)
+        mean_iou = ious.mean().item()
+        metrics = {
+            'mean_iou': mean_iou,
+            'median_iou': ious.median().item(),
+            'iou_05': (ious > 0.5).float().mean().item(),
+            'iou_75': (ious > 0.75).float().mean().item(),
+        }
         
-        # Summary Log
-        tracker.log_epoch_summary(epoch + 1, args.epochs, current_lr, metrics, recall_val)
-        scheduler.step()
+        # Logging metrics
+        tracker.log_epoch_summary(epoch + 1, args.epochs, current_lr, metrics)
 
-        # Save Visualizations (Top 5 and Median 5)
+        # Save Visualizations (Top and worst IoU)
         epoch_vis_dir = os.path.join(vis_dir, f"epoch_{epoch+1:03d}")
-        os.makedirs(epoch_vis_dir, exist_ok=True)
         
-        all_vis_data.sort(key=lambda x: x['err'], reverse=True)
-        top_5 = all_vis_data[:5]
-        
-        median_idx = len(all_vis_data) // 2
-        median_5 = all_vis_data[max(0, median_idx-2) : median_idx+3]
+        all_vis_data.sort(key=lambda x: x['iou']) # worst to best
+        worst_5 = all_vis_data[:5]
+        best_5 = all_vis_data[-5:]
         
         from PIL import Image
-        import torchvision.transforms.functional as TF
         from common.transforms import get_train_transforms
-        vis_transforms = get_train_transforms(image_size=None, min_size=args.min_size, max_size=args.max_size, is_train=False)
+        vis_transforms = get_train_transforms(image_size=args.image_size, min_size=None, max_size=None, is_train=False)
 
         def dump_vis_set(subset, prefix):
             for i, sample in enumerate(subset):
-                # 1. Reload the image and simulate the padding dynamically to match the tensor constraint
                 try:
                     raw_img = Image.open(sample['path']).convert("RGB")
                 except:
                     continue
                 img_t, _ = vis_transforms(raw_img, [])
-                c, h, w = img_t.shape
-                # Must cast to int as pad_w/pad_h were stored as floats
-                pad_w_int = int(sample['pad_w'])
-                pad_h_int = int(sample['pad_h'])
-                pad_len = (0, max(0, pad_w_int - w), 0, max(0, pad_h_int - h))
-                padded_img = torch.nn.functional.pad(img_t, pad_len, value=0.0)
-                
-                # 2. Draw
-                save_diagnostic_visualization(
-                    padded_img, sample['pred'], sample['gt'],
-                    None, None,
-                    f"{prefix}_{i}_err_{sample['err']:.1f}_{os.path.basename(sample['path'])}", epoch_vis_dir
-                )
+                draw_diagnostic_boxes(img_t, sample['pred_box'], sample['gt_box'], f"{prefix}_{i}_iou_{sample['iou']:.2f}_{os.path.basename(sample['path'])}", epoch_vis_dir)
 
-        dump_vis_set(top_5, "top")
-        dump_vis_set(median_5, "median")
+        dump_vis_set(worst_5, "worst")
+        dump_vis_set(best_5, "best")
 
-        # Checkpoint (Targeting recall_96 explicitly)
+        # Checkpoint
         latest_path = os.path.join(run_dir, 'checkpoints', 'last.pt')
-        save_checkpoint(model, optimizer, scheduler, epoch + 1, recall_val['recall_96'], latest_path)
+        save_checkpoint(model, optimizer, scheduler, epoch + 1, mean_iou, latest_path)
         
-        current_recall = recall_val['recall_96']
-        current_mean = metrics['mean']
-        
-        is_better = False
-        if current_recall > best_recall_96:
-            is_better = True
-        elif current_recall == best_recall_96 and current_mean < best_mean_error:
-            is_better = True
-            
-        if is_better:
-            best_recall_96 = current_recall
-            best_mean_error = current_mean
+        if mean_iou > best_mean_iou:
+            best_mean_iou = mean_iou
             best_path = os.path.join(run_dir, 'checkpoints', 'best.pt')
-            save_checkpoint(model, optimizer, scheduler, epoch + 1, best_recall_96, best_path)
-            logger.info(f"New best model: {best_path} (recall_96={best_recall_96:.1f}%, mean_err={best_mean_error:.3f})")
+            save_checkpoint(model, optimizer, scheduler, epoch + 1, best_mean_iou, best_path)
+            logger.info(f"New best model: {best_path} (IoU={best_mean_iou:.4f})")
+            
+        scheduler.step()
 
     total_time = (sync_time() - global_start_time) / 60
-    logger.info(f"Training finished in {total_time:.1f}m. Best Recall@96: {best_recall_96:.1f}%")
-
+    logger.info(f"Training finished in {total_time:.1f}m. Best Mean IoU: {best_mean_iou:.4f}")
 
 if __name__ == "__main__":
     main()
