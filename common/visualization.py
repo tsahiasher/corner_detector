@@ -36,15 +36,22 @@ def save_diagnostic_visualization(
     pred_np = pred_corners.cpu().numpy() if isinstance(pred_corners, torch.Tensor) else np.array(pred_corners)
     tgt_np = target_corners.cpu().numpy() if isinstance(target_corners, torch.Tensor) else np.array(target_corners)
     
+    # Squeeze batch dimension if present (e.g. from [1, 4, 2] to [4, 2])
+    if pred_np.ndim == 3 and pred_np.shape[0] == 1:
+        pred_np = pred_np[0]
+    if tgt_np.ndim == 3 and tgt_np.shape[0] == 1:
+        tgt_np = tgt_np[0]
+
     pred_px = (pred_np * [w, h]).astype(np.int32)
     tgt_px = (tgt_np * [w, h]).astype(np.int32)
+
     
-    # Draw secondary (coarse) corners if provided
+    # Draw secondary (boundingbox) corners if provided
     if secondary_corners is not None:
         sec_np = secondary_corners.cpu().numpy() if isinstance(secondary_corners, torch.Tensor) else np.array(secondary_corners)
         sec_px = (sec_np * [w, h]).astype(np.int32)
         for px, py in sec_px:
-            cv2.circle(img, (int(px), int(py)), 3, (255, 0, 0), -1) # Blue Coarse
+            cv2.circle(img, (int(px), int(py)), 3, (255, 0, 0), -1) # Blue BoundingBox
 
     # If exactly 4 corners, draw a closed quad
     if len(tgt_px) == 4:
@@ -80,3 +87,62 @@ def save_diagnostic_visualization(
     os.makedirs(output_dir, exist_ok=True)
     fname = os.path.basename(img_path)
     cv2.imwrite(os.path.join(output_dir, fname), combined)
+
+
+def save_local_refining_debug(
+    patches: torch.Tensor,
+    heatmaps: torch.Tensor,
+    img_path: str,
+    output_dir: str
+) -> None:
+    """Saves a grid showing the 4 corner patches and their local heatmaps."""
+    try:
+        import cv2
+    except ImportError:
+        return
+
+    # patches: [4, C, H, W], heatmaps: [4, 1, Hh, Wh]
+    p_np = patches.detach().cpu().numpy()
+    h_np = torch.sigmoid(heatmaps).detach().cpu().numpy()
+    
+    B, C, H, W = p_np.shape
+    _, _, Hh, Wh = h_np.shape
+    
+    vis_patches = []
+    for i in range(4):
+        # 1. Patch Visualization
+        p = p_np[i] # [C, H, W]
+        if C == 3:
+            p = p.transpose(1, 2, 0)
+            p = (np.clip(p, 0, 1) * 255).astype(np.uint8)
+            p = cv2.cvtColor(p, cv2.COLOR_RGB2BGR)
+        else:
+            # For 64-channel features, visualize mean energy
+            p = np.mean(p, axis=0) # [H, W]
+            p = (np.clip(p, 0, 1) * 255).astype(np.uint8)
+            p = cv2.cvtColor(p, cv2.COLOR_GRAY2BGR)
+            
+        p = cv2.resize(p, (128, 128), interpolation=cv2.INTER_NEAREST)
+
+        
+        # 2. Heatmap overlay
+        h = h_np[i, 0]
+        h_vis = cv2.applyColorMap((h * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        h_vis = cv2.resize(h_vis, (128, 128), interpolation=cv2.INTER_NEAREST)
+        
+        # Add labels
+        label = f"Corner {i}"
+        cv2.putText(p, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Combine patch and heatmap
+        vis_patches.append(np.hstack([p, h_vis]))
+
+    # Stack into 2x2 grid
+    top = np.hstack([vis_patches[0], vis_patches[1]])
+    bottom = np.hstack([vis_patches[3], vis_patches[2]]) # TL, TR, BL, BR sequence matches clockwise-ish if needed
+    grid = np.vstack([top, bottom])
+    
+    os.makedirs(output_dir, exist_ok=True)
+    fname = "refine_" + os.path.basename(img_path)
+    cv2.imwrite(os.path.join(output_dir, fname), grid)
+

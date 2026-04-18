@@ -7,7 +7,7 @@ import torchvision.models as models
 class OrientNet(nn.Module):
     """Lightweight card orientation classifier.
 
-    Input:  [B, 3, 128, 128]  — warped card crop (output of Coarse homography).
+    Input:  [B, 3, 128, 128]  — warped card crop (output of BoundingBox homography).
     Output: [B, 4]            — logits for rotation classes 0°, 90°, 180°, 270°.
 
     Architecture:

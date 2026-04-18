@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 
-from coarse.models.coarse_quad_net import CoarseQuadNet
-from coarse.datasets.coco_val_dataset import COCOValDataset
+from boundingbox.models.boundingbox_quad_net import BoundingBoxQuadNet
+from boundingbox.datasets.coco_val_dataset import COCOValDataset
 from common.checkpoint import load_checkpoint
 from common.seed import set_seed
 from common.metrics import calculate_accuracy_metrics, compute_patch_recall
@@ -25,7 +25,7 @@ from common.transforms import denormalize_image
 def setup_logging(log_file: str) -> logging.Logger:
     """Configures evaluation logging."""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    logger = logging.getLogger('coarse_eval')
+    logger = logging.getLogger('boundingbox_eval')
     logger.setLevel(logging.INFO)
     if logger.hasHandlers():
         logger.handlers.clear()
@@ -101,7 +101,7 @@ def main() -> None:
     os.makedirs(os.path.join(run_dir, 'visualizations'), exist_ok=True)
 
     logger = setup_logging(os.path.join(run_dir, 'logs', 'eval.log'))
-    logger.info("=== Coarse Evaluation (Global Regressor) ===")
+    logger.info("=== BoundingBox Evaluation (Global Regressor) ===")
 
     set_seed(42)
     device = resolve_device(args.device)
@@ -115,7 +115,7 @@ def main() -> None:
         model = torch.jit.load(args.weights, map_location=device)
         logger.info("Loaded TorchScript model.")
     except Exception:
-        model = CoarseQuadNet().to(device)
+        model = BoundingBoxQuadNet().to(device)
         load_checkpoint(model, None, None, args.weights, device=device)
         logger.info("Loaded eager checkpoint.")
 

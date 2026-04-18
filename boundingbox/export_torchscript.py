@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import torch
 import torch.nn as nn
 
-from coarse.models.coarse_quad_net import CoarseQuadNet
+from boundingbox.models.boundingbox_quad_net import BoundingBoxQuadNet
 from common.checkpoint import load_checkpoint
 from common.device import add_device_args, resolve_device, log_device_info
 
@@ -35,9 +35,9 @@ def setup_logging(log_file: str) -> logging.Logger:
 
 def parse_args() -> argparse.Namespace:
     """Parses command line arguments for exporting the model to TorchScript."""
-    parser = argparse.ArgumentParser(description="Export CoarseQuadNet to TorchScript for edge CPU deployment.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(description="Export BoundingBoxQuadNet to TorchScript for edge CPU deployment.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--weights', type=str, required=True, help="Path to the trained PyTorch checkpoint (.pt) to load.")
-    parser.add_argument('--output', type=str, default='coarse_quad_net.pt', help="Path to save the exported TorchScript model.")
+    parser.add_argument('--output', type=str, default='boundingbox_quad_net.pt', help="Path to save the exported TorchScript model.")
     add_device_args(parser, default='cpu')
     parser.add_argument('--input_height', type=int, default=384, help="Height of the dummy input tensor used for tracing.")
     parser.add_argument('--input_width', type=int, default=384, help="Width of the dummy input tensor used for tracing.")
@@ -84,7 +84,7 @@ def main() -> None:
     log_device_info(device, args.device, logger)
     
     # 1. Load Model
-    eager_model = CoarseQuadNet().to(device)
+    eager_model = BoundingBoxQuadNet().to(device)
     logger.info(f"Loading checkpoint weights from: {args.weights}")
     try:
         load_checkpoint(eager_model, None, None, args.weights, device=device)

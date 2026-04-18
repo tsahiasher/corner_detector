@@ -28,13 +28,13 @@ class OrientDataset(Dataset):
     Design (matches inference exactly):
     1. Load image + YOLO keypoints (physical corners [TL, TR, BR, BL] in [0,1]).
     2. Sort the 4 physical corners by atan2(dy, dx) ascending — the SAME sort
-       the coarse model applies to its predicted corners at inference time.
+       the boundingbox model applies to its predicted corners at inference time.
     3. Warp the card quad using the *atan2-sorted* corners as source.
        The resulting canonical crop may look upside-down, rotated, etc.
     4. Label  =  get_visual_orientation(keypoints)
               =  which slot in the atan2-sorted sequence the physical TL occupies.
        This is exactly the cyclic shift 's' needed at inference so that
-       corners_final[0] = corners_coarse[s] = physical TL.
+       corners_final[0] = corners_boundingbox[s] = physical TL.
 
     Returns a dict with:
         - ``image``   : [3, H, W] normalised tensor
@@ -99,7 +99,7 @@ class OrientDataset(Dataset):
         # sorted sequence.  This is the cyclic shift the inference code needs.
         orient_class = get_visual_orientation(keypoints)  # 0..3
 
-        # We now use the complete, dynamically resized image exactly like the Coarse stage.
+        # We now use the complete, dynamically resized image exactly like the BoundingBox stage.
         image_t, _ = self.transforms(image, keypoints)
 
         return {

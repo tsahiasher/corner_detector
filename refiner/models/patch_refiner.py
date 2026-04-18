@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from common.metrics import SoftArgmax2D
 
 class ConvBNReLU(nn.Module):
     def __init__(self, in_planes, out_planes, stride=1, groups=1):
@@ -12,100 +13,143 @@ class ConvBNReLU(nn.Module):
         )
     def forward(self, x): return self.conv(x)
 
-class IterativeRefinerNet(nn.Module):
+class FullCardRefinerNet(nn.Module):
     """
-    Stage 2: Iterative High-Precision Patch Refiner.
-    Performs a two-level search:
-    1. Global: Finds the corner in the 96x96 patch (24x24 heatmap).
-    2. Local: Crops a 32x32 sub-patch and predicts a high-precision offset.
+    High-Precision Stage 2: Full-Card Corner Refiner.
+    Uses Hierarchical Local Refinement:
+    1. Coarse prediction from bottleneck features (Stride 32).
+    2. Local patch sampling from high-resolution features (Stride 8).
+    3. Residual refinement from local patches.
+    Input Size: 640x640
     """
-    def __init__(self, input_size=96, fine_patch_size=32):
+    def __init__(self, input_size=640, patch_size=7):
         super().__init__()
         self.input_size = input_size
-        self.fine_patch_size = fine_patch_size
-        self.size_ratio = fine_patch_size / input_size
+        self.patch_size = patch_size
         
-        # --- Stage 1: Global Backbone (96x96 -> 24x24) ---
-        self.global_features = nn.Sequential(
-            ConvBNReLU(3, 32, stride=2),   # 48
-            ConvBNReLU(32, 64, stride=1),  # 48
-            ConvBNReLU(64, 64, stride=2),  # 24
-            ConvBNReLU(64, 128, stride=1), # 24
+        # 1. Backbone: Stride 4 -> 8 -> 16 -> 32
+        self.stem = nn.Sequential(
+            ConvBNReLU(3, 32, stride=2),   # 320
+            ConvBNReLU(32, 64, stride=2),  # 160 (Stride 4)
+        )
+        
+        self.stage1 = nn.Sequential(
+            ConvBNReLU(64, 64, stride=1),
+            ConvBNReLU(64, 128, stride=2), # 80 (Stride 8) - FINE FEATURES (f1)
+        )
+        
+        self.stage2 = nn.Sequential(
             ConvBNReLU(128, 128, stride=1),
+            ConvBNReLU(128, 256, stride=2), # 40 (Stride 16)
         )
         
+        self.stage3 = nn.Sequential(
+            ConvBNReLU(256, 256, stride=1),
+            ConvBNReLU(256, 512, stride=2), # 20 (Stride 32) - COARSE FEATURES (f3)
+        )
+        
+        # 2. Coarse Head: 512 x 20 x 20 -> 4 points [0, 1]
         self.coarse_head = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            ConvBNReLU(512, 128, stride=2), # 10 x 10
+            ConvBNReLU(128, 64, stride=2),  # 5 x 5
+            nn.Flatten(),
+            nn.Linear(64 * 5 * 5, 256),
             nn.ReLU6(inplace=True),
-            nn.Conv2d(64, 1, 1)
+            nn.Linear(256, 8),
+            nn.Sigmoid() 
         )
         
-        # --- Stage 2: Fine Refinement (32x32 -> 32x32) ---
-        self.fine_features = nn.Sequential(
-            ConvBNReLU(3, 32, stride=1),    # 32
-            ConvBNReLU(32, 64, stride=2),   # 16
-            ConvBNReLU(64, 64, stride=1),   # 16
-            ConvBNReLU(64, 128, stride=2),  # 8
-        )
-        
-        self.fine_head = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+        # 3. Local Refine Head: Shared for 4 patches [128, 7, 7]
+        self.local_head = nn.Sequential(
+            ConvBNReLU(128, 64, stride=1), # 7-2=5 (no pad) or use pad=1
+            ConvBNReLU(64, 64, stride=1),  
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 128),
             nn.ReLU6(inplace=True),
-            nn.Upsample(size=(fine_patch_size, fine_patch_size), mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 1, 1)
+            nn.Linear(128, 2), # 2D residual (dx, dy)
+            nn.Tanh() # Bounded [-1, 1]
         )
         
-        from common.metrics import SoftArgmax2D
-        self.soft_argmax_coarse = SoftArgmax2D(beta=20.0)
-        self.soft_argmax_fine = SoftArgmax2D(beta=50.0)
-        
-        # Initialization: Force initial predictions to center
-        nn.init.zeros_(self.coarse_head[-1].weight)
-        nn.init.zeros_(self.coarse_head[-1].bias)
-        nn.init.zeros_(self.fine_head[-1].weight)
-        nn.init.zeros_(self.fine_head[-1].bias)
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
 
-    @torch.jit.ignore
-    def _get_grid(self, B: int, device: torch.device):
-        """Helper to create sampling grid for local crop."""
-        grid_base = torch.meshgrid(
-            torch.linspace(-1, 1, self.fine_patch_size, device=device),
-            torch.linspace(-1, 1, self.fine_patch_size, device=device),
-            indexing='ij'
-        )
-        # Convert to (x, y) format for grid_sample
-        grid_base = torch.stack([grid_base[1], grid_base[0]], dim=-1) # [fine, fine, 2]
-        return grid_base.unsqueeze(0).expand(B, -1, -1, -1)
+    def extract_local_patches(self, features, coords):
+        """
+        Differentiable sampling of local patches around predicted coords.
+        Args:
+            features: [B, C, Hf, Wf] (e.g. 80x80)
+            coords: [B, 4, 2] in [0, 1] normalized space
+        Returns:
+            patches: [B*4, C, S, S]
+        """
+        B, C, Hf, Wf = features.size()
+        S = self.patch_size
+        device = features.device
+        
+        # 1. Map [0, 1] to [-1, 1] for grid_sample
+        center_pts = 2.0 * coords - 1.0 # [B, 4, 2]
+        
+        # 2. Create relative grid for SxS patch
+        # Step in [-1, 1] space is 2.0 / feature_resolution
+        step_x = 2.0 / Wf
+        step_y = 2.0 / Hf
+        
+        offsets = torch.linspace(-(S-1)/2, (S-1)/2, S, device=device)
+        ox, oy = torch.meshgrid(offsets, offsets, indexing='xy') # [S, S]
+        rel_grid = torch.stack([ox * step_x, oy * step_y], dim=-1) # [S, S, 2]
+        
+        # 3. Create global grid: [B, 4, S, S, 2]
+        # center_pts: [B, 4, 1, 1, 2], rel_grid: [1, 1, S, S, 2]
+        grid = center_pts.view(B, 4, 1, 1, 2) + rel_grid.view(1, 1, S, S, 2)
+        
+        # 4. Reshape for grid_sample: [B, 4*S, S, 2]
+        grid = grid.view(B, 4 * S, S, 2)
+        
+        # 5. Sample: [B, C, 4*S, S]
+        sampled = F.grid_sample(features, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        
+        # 6. Reshape to [B*4, C, S, S]
+        patches = sampled.view(B, C, 4, S, S).permute(0, 2, 1, 3, 4).reshape(B * 4, C, S, S)
+        return patches
 
     def forward(self, x):
+        """
+        Args:
+            x: [B, 3, 640, 640]
+        Returns:
+            final_coords: [B, 4, 2]
+            coarse_coords: [B, 4, 2]
+        """
         B = x.size(0)
+        s = self.stem(x)         # 160x160
+        f1 = self.stage1(s)      # 80x80 (fine resolution)
+        f2 = self.stage2(f1)     # 40x40
+        f3 = self.stage3(f2)     # 20x20
         
-        # 1. Coarse Stage
-        g_feats = self.global_features(x)
-        g_heatmap = self.coarse_head(g_feats)
-        coarse_coords = self.soft_argmax_coarse(g_heatmap) # [B, 2] in [0, 1]
+        # Step 1: Coarse Prediction [B, 4, 2]
+        coarse = self.coarse_head(f3).view(B, 4, 2)
         
-        # 2. Local Stage (Differentiable Zoom)
-        # grid_sample expects coordinates in [-1, 1]
-        grid = self._get_grid(B, x.device) * self.size_ratio
-        shift = (coarse_coords * 2.0 - 1.0).view(B, 1, 1, 2)
-        grid = grid + shift
+        # Step 2: Differentiable Sampling of Local Patches [B*4, C, 7, 7]
+        patches = self.extract_local_patches(f1, coarse)
         
-        fine_patch = F.grid_sample(x, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        # Step 3: Local Refinement Head -> 2D residuals (dx, dy)
+        res_raw = self.local_head(patches) # [B*4, 2]
+        residuals = res_raw.view(B, 4, 2)
         
-        # 3. Fine Stage
-        f_feats = self.fine_features(fine_patch)
-        f_heatmap = self.fine_head(f_feats)
-        fine_offsets = self.soft_argmax_fine(f_heatmap) # [B, 2] in [0, 1] relative to fine_patch
+        # Scale residuals: 0.1 (64 pixels in 640px image)
+        final = coarse + residuals * 0.1
+        final = torch.clamp(final, 0.0, 1.0)
         
-        # 4. Integrate Coordinates
-        # coarse_coords is absolute 96x96 space center
-        # fine_offsets is [0, 1] within the 32x32 patch area
-        final_coords = coarse_coords + (fine_offsets - 0.5) * self.size_ratio
-        
-        return final_coords, coarse_coords
+        return final, coarse
 
-# Re-export as PatchRefinerNet for backward compatibility in imports
-PatchRefinerNet = IterativeRefinerNet
+# Compatibility alias
+FullCardCornerNet = FullCardRefinerNet
+PatchRefinerNet = FullCardRefinerNet

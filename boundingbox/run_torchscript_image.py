@@ -16,7 +16,7 @@ from PIL import Image
 
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
 from common.checkpoint import load_checkpoint
-from coarse.models.coarse_quad_net import CoarseQuadNet
+from boundingbox.models.boundingbox_quad_net import BoundingBoxQuadNet
 
 def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
     """Configures explicit, clean logging for deterministic inference."""
@@ -198,7 +198,7 @@ def process_image(img_path: str, model: Any, args: argparse.Namespace, device: t
         if not args.no_vis and args.save_vis:
             logger.info(f"\nSaved visualization to: {os.path.join(args.output_dir, os.path.basename(img_path))}")
         if args.save_json:
-            logger.info(f"Saved coarse results for refiner Stage 2 Stage to: {json_path}")
+            logger.info(f"Saved boundingbox results for refiner Stage 2 Stage to: {json_path}")
 
         logger.info("\n--- Edge Deployment Telemetry ---")
         logger.info(f"  Load image:  {t_load_img*1000:>6.1f} ms")
@@ -259,12 +259,12 @@ def main() -> None:
     t0 = sync_time()
     try:
         if args.pytorch:
-            logger.info(f"Loading Coarse model (PyTorch): {args.model}")
-            model = CoarseQuadNet().to(device)
+            logger.info(f"Loading BoundingBox model (PyTorch): {args.model}")
+            model = BoundingBoxQuadNet().to(device)
             load_checkpoint(model, None, None, args.model, device=device)
             model.eval()
         else:
-            logger.info(f"Loading Coarse model (TorchScript): {args.model}")
+            logger.info(f"Loading BoundingBox model (TorchScript): {args.model}")
             model = torch.jit.load(args.model, map_location=device)
             model.eval()
     except Exception as e:

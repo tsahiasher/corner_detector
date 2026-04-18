@@ -5,7 +5,8 @@ description: build and iterate a production-quality, edge-optimized machine lear
 
 # Build the production pipeline
 
-Implement a production-quality, CPU-first, coarse-to-fine keypoint pipeline for a single rectangular ID card with exactly 4 ordered corners.
+Implement a production-quality, CPU-first, boundingbox-to-refiner keypoint pipeline for a single rectangular ID card with exactly 4 ordered corners.
+
 
 Always optimize for this constraint set:
 - single class
@@ -21,7 +22,7 @@ Do not default to heavyweight generic detectors unless the user explicitly asks 
 
 Use this 4-stage design as the default:
 
-1. **Coarse detector (Spatially-Aware Bounding Box Regressor)**
+1. **BoundingBox detector (Spatially-Aware Bounding Box Regressor)**
    - Run a lightweight CPU-friendly backbone on a fixed padded input.
    - **Crucial Pattern**: Do NOT use 4 independent dense heatmaps for the corners.
    - **Crucial Pattern**: Do NOT use massive `AdaptiveAvgPool` global pooling dropping straight into independent coordinate MLPs since it wipes away structural relationships.
@@ -33,16 +34,16 @@ Use this 4-stage design as the default:
    - Downstream processes manually expand this generalized bounding block configuration.
 
 2. **Stage 2.5 – Orientation classification (OrientNet, optional)**
-   - Run ONLY after the coarse model has localized the card.
-   - Warp the card to a 128×128 canonical square using the coarse homography.
+   - Run ONLY after the boundingbox model has localized the card.
+   - Warp the card to a 128×128 canonical square using the boundingbox homography.
    - Feed the crop into a tiny (~50k param) MobileNet-style classifier predicting rotation: 0°, 90°, 180°, or 270°.
-   - Cyclically shift the coarse corners so `corners[0]` is the physical TL.
+   - Cyclically shift the boundingbox corners so `corners[0]` is the physical TL.
    - **When to add this stage**: Only when physical corner identity (not just geometric consistency) is required downstream (e.g., crop face vs. barcode side). If only precise localization is needed, skip it.
    - Training: Use GT homography to warp training images to canonical form. Apply colour jitter. Train with `CrossEntropyLoss(label_smoothing=0.05)` for 25–30 epochs with `AdamW + CosineAnnealingLR`.
    - Export: TorchScript trace at 128×128 input.
 
 3. **Rectification**
-   - Compute a homography from the coarse quadrilateral to a canonical upright card plane.
+   - Compute a homography from the boundingbox quadrilateral to a canonical upright card plane.
    - Warp the image into a fixed canonical resolution.
 
 3. **Corner refinement**
@@ -81,7 +82,7 @@ Dataset rules:
 Keep module interfaces simple and stable.
 
 Preferred modules:
-- `CoarseQuadNet`
+- `BoundingBoxQuadNet`
 - `OrientNet`
 - `PatchRefiner`
 - `geometry`
@@ -222,7 +223,7 @@ Do not treat loss as the primary success metric once evaluation metrics are avai
 
 ## Model guidance for stage 1
 
-For the coarse detector:
+For the boundingbox detector:
 - keep the backbone lightweight and CPU-friendly
 - preserve spatial information in the head (do NOT drop straight to 1x1 Global Average Pooling dynamically mapping outputs without intermediary preservation bounds)
 - output exactly 1 strict bounding context natively per image assuming ID cards stream inherently.
@@ -231,7 +232,7 @@ For the coarse detector:
 ## Training guidance
 
 For stage 1:
-- optimize for robust coarse localization, not final sub-pixel output
+- optimize for robust boundingbox localization, not final sub-pixel output
 - use augmentations that match the real task:
   - rotation
   - scaling
@@ -239,6 +240,7 @@ For stage 1:
   - perspective or skew
   - crop and padding simulation
 - only use flips if corner ordering is updated correctly afterward
+
 
 For stage 2:
 - use local heatmaps plus offsets for precise refinement on rectified corner patches

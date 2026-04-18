@@ -94,7 +94,7 @@ class TrainingTracker:
         # Accuracy Metrics
         if metrics:
             if 'mean_iou' in metrics:
-                # IoU-based metrics (Typical for Coarse / Global Regressor)
+                # IoU-based metrics (Typical for BoundingBox / Global Regressor)
                 me = metrics.get('mean_iou', 0.0)
                 md = metrics.get('median_iou', 0.0)
                 self.logger.info(f"IoU Metrics: Mean: {me:.4f} | Med: {md:.4f}")

@@ -11,9 +11,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from coarse.models.coarse_quad_net import CoarseQuadNet
-from coarse.datasets.yolo_keypoint_dataset import YOLOKeypointDataset, collate_fn_pad
-from coarse.datasets.coco_val_dataset import COCOValDataset
+from boundingbox.models.boundingbox_quad_net import BoundingBoxQuadNet
+from boundingbox.datasets.yolo_keypoint_dataset import YOLOKeypointDataset, collate_fn_pad
+from boundingbox.datasets.coco_val_dataset import COCOValDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
@@ -23,7 +23,7 @@ from common.logging_utils import TrainingTracker
 def setup_logging(log_file: str) -> logging.Logger:
     """Configures production-quality logging to both console and file."""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    logger = logging.getLogger('coarse_train')
+    logger = logging.getLogger('boundingbox_train')
     logger.setLevel(logging.INFO)
     if logger.hasHandlers():
         logger.handlers.clear()
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--batch_size', type=int, default=16, help="Training batch size.")
     parser.add_argument('--image_size', type=int, default=384, help="Fixed square input size.")
     parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument('--runs_dir', type=str, default='./coarse/runs', help="Base directory for training runs.")
+    parser.add_argument('--runs_dir', type=str, default='./boundingbox/runs', help="Base directory for training runs.")
     parser.add_argument('--name', type=str, default='bounding_box', help="Optional suffix for the run directory.")
     parser.add_argument('--resume', type=str, default='', help="Path to checkpoint to resume from.")
     
@@ -175,7 +175,7 @@ def main() -> None:
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
                             num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn_pad)
 
-    model = CoarseQuadNet().to(device)
+    model = BoundingBoxQuadNet().to(device)
     param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: Spatially-Aware Regressor | Parameters: {param_count:,}")
 

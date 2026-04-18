@@ -3,12 +3,12 @@
 Usage:
     python orient/run_torchscript_image.py \\
         --orient_model orient/runs/<run>/checkpoints/orient_net.pt \\
-        --coarse_model coarse/runs/<run>/checkpoints/best.pt \\
+        --boundingbox_model boundingbox/runs/<run>/checkpoints/best.pt \\
         --input /path/to/image_or_dir \\
         [--pytorch] [--output_dir results/]
 
 The script:
-  1. Runs the Coarse model to get 4 corners.
+  1. Runs the BoundingBox model to get 4 corners.
   2. Warps the card to a 128x128 canonical crop using the GT homography.
   3. Runs OrientNet to classify rotation (0°/90°/180°/270°).
   4. Applies the inverse cyclic shift so corners[0] is the physical TL.
@@ -35,7 +35,7 @@ import torchvision.transforms as T
 from common.device import add_device_args, resolve_device, log_device_info, sync_time
 from common.checkpoint import load_checkpoint
 from common.geometry import compute_homography, warp_image
-from coarse.models.coarse_quad_net import CoarseQuadNet
+from boundingbox.models.boundingbox_quad_net import BoundingBoxQuadNet
 from orient.models.orient_net import OrientNet
 
 MEAN = [0.485, 0.456, 0.406]
@@ -57,13 +57,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='OrientNet standalone inference.')
     parser.add_argument('--orient_model', type=str, required=True,
                         help='Path to OrientNet model (.pt).')
-    parser.add_argument('--coarse_model', '--coarse_mode', type=str, required=True,
-                        help='Path to Coarse model (.pt).')
+    parser.add_argument('--boundingbox_model', '--boundingbox_mode', type=str, required=True,
+                        help='Path to BoundingBox model (.pt).')
     parser.add_argument('--input', type=str, required=True,
                         help='Path to image or directory.')
     parser.add_argument('--output_dir', type=str, default='',
                         help='Results directory. Defaults to <input>_orient.')
-    parser.add_argument('--coarse_size', type=int, default=384)
+    parser.add_argument('--boundingbox_size', type=int, default=384)
     parser.add_argument('--crop_size',  type=int, default=128,
                         help='Canonical crop size fed to OrientNet.')
     parser.add_argument('--save_json', action='store_true', default=True)
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def preprocess_coarse(image: Image.Image, size: int, device: torch.device) -> torch.Tensor:
+def preprocess_boundingbox(image: Image.Image, size: int, device: torch.device) -> torch.Tensor:
     img = TF.resize(image, [size, size])
     t   = TF.to_tensor(img)
     t   = TF.normalize(t, MEAN, STD)
@@ -126,7 +126,7 @@ def draw_result(img_bgr: np.ndarray, corners_px: List[List[float]],
     return vis
 
 
-def process_image(img_path: str, coarse_model: Any, orient_model: Any,
+def process_image(img_path: str, boundingbox_model: Any, orient_model: Any,
                   args: argparse.Namespace, device: torch.device,
                   logger: logging.Logger):
     t0 = sync_time()
@@ -140,14 +140,14 @@ def process_image(img_path: str, coarse_model: Any, orient_model: Any,
         logger.error(f'Cannot load {img_path}: {e}')
         return None
 
-    # ── Stage 1: Coarse ─────────────────────────────────────────────────
+    # ── Stage 1: BoundingBox ─────────────────────────────────────────────────
     t1 = sync_time()
-    coarse_in = preprocess_coarse(pil_img, args.coarse_size, device)
+    boundingbox_in = preprocess_boundingbox(pil_img, args.boundingbox_size, device)
     with torch.inference_mode():
-        coarse_out = coarse_model(coarse_in)
-    corners_norm = coarse_out['corners'][0].cpu().tolist()   # [4, 2]
+        boundingbox_out = boundingbox_model(boundingbox_in)
+    corners_norm = boundingbox_out['corners'][0].cpu().tolist()   # [4, 2]
     corners_px   = [[nx * orig_w, ny * orig_h] for nx, ny in corners_norm]
-    t_coarse = sync_time() - t1
+    t_boundingbox = sync_time() - t1
 
     # ── Stage 2.5: Orient ────────────────────────────────────────────────
     t2 = sync_time()
@@ -162,7 +162,7 @@ def process_image(img_path: str, coarse_model: Any, orient_model: Any,
 
     t_total = sync_time() - t0
     logger.info(f'  {os.path.basename(img_path):30s} | Orient: {ORIENT_LABELS[orient_class].strip():4s} '
-                f'| Coarse: {t_coarse*1000:.1f}ms | Orient: {t_orient*1000:.1f}ms | Total: {t_total*1000:.1f}ms')
+                f'| BoundingBox: {t_boundingbox*1000:.1f}ms | Orient: {t_orient*1000:.1f}ms | Total: {t_total*1000:.1f}ms')
 
     # ── Visualisation ────────────────────────────────────────────────────
     if not args.no_vis:
@@ -175,9 +175,9 @@ def process_image(img_path: str, coarse_model: Any, orient_model: Any,
             'image': img_path,
             'orient_class': orient_class,
             'orient_label': ORIENT_LABELS[orient_class].strip(),
-            'coarse_corners': corners_px,
+            'boundingbox_corners': corners_px,
             'final_corners':  corners_final,
-            'times_ms': {'coarse': t_coarse*1000, 'orient': t_orient*1000, 'total': t_total*1000},
+            'times_ms': {'boundingbox': t_boundingbox*1000, 'orient': t_orient*1000, 'total': t_total*1000},
         }
         json_name = os.path.splitext(os.path.basename(img_path))[0] + '.json'
         with open(os.path.join(args.output_dir, json_name), 'w') as f:
@@ -201,15 +201,15 @@ def main() -> None:
 
     # Load models
     if args.pytorch:
-        coarse_model = CoarseQuadNet().to(device)
-        load_checkpoint(coarse_model, None, None, args.coarse_model, device=device)
-        coarse_model.eval()
+        boundingbox_model = BoundingBoxQuadNet().to(device)
+        load_checkpoint(boundingbox_model, None, None, args.boundingbox_model, device=device)
+        boundingbox_model.eval()
         orient_model = OrientNet(num_classes=4).to(device)
         load_checkpoint(orient_model, None, None, args.orient_model, device=device)
         orient_model.eval()
     else:
-        coarse_model = torch.jit.load(args.coarse_model, map_location=device)
-        coarse_model.eval()
+        boundingbox_model = torch.jit.load(args.boundingbox_model, map_location=device)
+        boundingbox_model.eval()
         orient_model = torch.jit.load(args.orient_model, map_location=device)
         orient_model.eval()
 
@@ -225,7 +225,7 @@ def main() -> None:
     t_start = time.time()
     ok = 0
     for p in image_paths:
-        t = process_image(p, coarse_model, orient_model, args, device, logger)
+        t = process_image(p, boundingbox_model, orient_model, args, device, logger)
         if t is not None:
             ok += 1
 

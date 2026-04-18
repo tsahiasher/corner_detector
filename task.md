@@ -1,4 +1,4 @@
-## 1) Stage 1 — Coarse Corner Detector
+## 1) Stage 1 — BoundingBox Corner Detector
 
 **Purpose:** Rapidly localize 4 corners on the full image.
 
@@ -34,11 +34,11 @@
 
 ## Training Commands
 
-### Stage 1: Coarse
+### Stage 1: BoundingBox
 ```bash
-python coarse/train.py --epochs 100 --batch_size 32 --mine_hard
-python coarse/test.py --weights coarse/runs/latest/checkpoints/best.pt
-python coarse/export_torchscript.py --weights coarse/runs/latest/checkpoints/best.pt
+python boundingbox/train.py --epochs 100 --batch_size 32 --mine_hard
+python boundingbox/test.py --weights boundingbox/runs/latest/checkpoints/best.pt
+python boundingbox/export_torchscript.py --weights boundingbox/runs/latest/checkpoints/best.pt
 ```
 
 ### Stage 1.5: Orientation
@@ -56,7 +56,7 @@ python refiner/test.py --weights refiner/runs/latest/checkpoints/best.pt
 ### Full Pipeline Inference
 ```bash
 python run_torchscript_image.py \
-    --coarse_model coarse/runs/latest/checkpoints/coarse_quad_net.pt \
+    --boundingbox_model boundingbox/runs/latest/checkpoints/boundingbox_quad_net.pt \
     --refiner_model refiner/runs/latest/checkpoints/patch_refiner.pt \
     --input your_image.jpg
-```
+```

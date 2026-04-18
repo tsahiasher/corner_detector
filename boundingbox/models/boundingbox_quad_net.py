@@ -10,7 +10,7 @@ import torch.nn as nn
 from typing import Dict, Any, Tuple
 import torchvision.models as models
 
-class CoarseQuadNet(nn.Module):
+class BoundingBoxQuadNet(nn.Module):
     """Spatially-Aware Global Bounding Box ID Card detector.
 
     Detects a single ID card and outputs a bounding box representing it explicitly

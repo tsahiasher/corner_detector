@@ -6,14 +6,14 @@ A production-grade, three-stage geometric machine learning pipeline for accurate
 
 ```text
 corner_detection/
-├── coarse/                     (Stage 1: Coarse Quad Detection)
+├── boundingbox/                     (Stage 1: BoundingBox Quad Detection)
 │   ├── datasets/               (YOLO keypoint dataset parsing)
 │   ├── models/                 (ResNet-18 + FPN + Dense Head)
 │   ├── runs/                   (Training logs, checkpoints, visualizations)
 │   ├── train.py                (Training entry point with Hard Example Mining)
 │   ├── test.py                 (Evaluation with pixel-space diagnostics)
 │   ├── export_torchscript.py   (Export Stage 1 to TorchScript)
-│   └── run_torchscript_image.py (Standalone coarse inference)
+│   └── run_torchscript_image.py (Standalone boundingbox inference)
 ├── orient/                     (Stage 1.5: Orientation Classification)
 │   ├── datasets/               (Warped card dataset)
 │   ├── models/                 (OrientNet: ~50k param classifier)
@@ -29,12 +29,12 @@ corner_detection/
 │   ├── metrics.py              (KeyPoint loss and accuracy metrics)
 │   ├── transforms.py           (Geometric data augmentation)
 │   └── visualization.py        (Diagnostic drawing)
-└── run_torchscript_image.py    (Unified Coarse → Refiner inference)
+└── run_torchscript_image.py    (Unified BoundingBox → Refiner inference)
 ```
 
 ---
 
-## Stage 1: Coarse Quad Detection
+## Stage 1: BoundingBox Quad Detection
 
 Stage 1 uses a **KeyPoint style** architecture for robust, multi-scale corner localization.
 
@@ -70,8 +70,8 @@ Stage 2 achieves sub-pixel precision using an **Iterative Refinement** network w
 
 ### Architecture
 - **Input**: 96x96 image patches centered on Stage 1 predictions.
-- **Global Stage**: Predicts a coarse corner location within the 96x96 patch.
-- **Local Stage (Zoom)**: Uses `F.grid_sample` to differentiably crop a 32x32 sub-patch centered on the coarse prediction.
+- **Global Stage**: Predicts a boundingbox corner location within the 96x96 patch.
+- **Local Stage (Zoom)**: Uses `F.grid_sample` to differentiably crop a 32x32 sub-patch centered on the boundingbox prediction.
 - **Fine Stage**: Predicts a high-precision offset within the 32x32 patch area using `SoftArgmax2D`.
 
 ### Loss Formulation
@@ -81,7 +81,7 @@ Stage 2 achieves sub-pixel precision using an **Iterative Refinement** network w
 ---
 
 ## Usage
-- **Train Coarse**: `python coarse/train.py --batch_size 16 --epochs 100`
+- **Train BoundingBox**: `python boundingbox/train.py --batch_size 16 --epochs 100`
 - **Train Orient**: `python orient/train.py --batch_size 64 --epochs 30`
 - **Train Refine**: `python refiner/train.py --batch_size 64`
-- **Run Full Pipeline**: `python run_torchscript_image.py --coarse_model path/to/coarse.pt --refiner_model path/to/refiner.pt --input image.jpg`
+- **Run Full Pipeline**: `python run_torchscript_image.py --boundingbox_model path/to/boundingbox.pt --refiner_model path/to/refiner.pt --input image.jpg`
