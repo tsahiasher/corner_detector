@@ -428,17 +428,13 @@ class DiceLoss(nn.Module):
         return 1. - dice.mean()
 
 
-class HeatmapFocalLoss(nn.Module):
-    """Gaussian heatmap loss for corner supervision using keypoint Focal Loss.
-    
-    Prevents background (0s) from overwhelmingly dominating sparse peaks (1s).
-    Based on CornerNet/CenterNet formulations.
+class HeatmapLoss(nn.Module):
+    """Gaussian heatmap loss using BCE with sum reduction for better gradient flow.
     """
-    def __init__(self, sigma: float = 2.0, alpha: float = 2.0, beta: float = 4.0) -> None:
+    def __init__(self, sigma: float = 4.0, pos_weight: float = 200.0) -> None:
         super().__init__()
         self.sigma = sigma
-        self.alpha = alpha
-        self.beta = beta
+        self.pos_weight = pos_weight
 
     def forward(self, pred_heatmaps: torch.Tensor, gt_corners: torch.Tensor) -> torch.Tensor:
         """
@@ -467,26 +463,13 @@ class HeatmapFocalLoss(nn.Module):
         dist_sq = torch.sum((grid.view(1, 1, H, W, 2) - gt_px_int) ** 2, dim=-1)
         target = torch.exp(-dist_sq / (2 * self.sigma ** 2))
         
-        # 2. Keypoint Focal Loss
-        pred = torch.clamp(torch.sigmoid(pred_heatmaps), min=1e-4, max=1-1e-4)
+        # 2. Weighted BCE Loss (on raw logits)
+        # Using reduction='sum' and dividing by (B*C) ensures the gradients 
+        # are strong enough to force peak formation.
+        loss = F.binary_cross_entropy_with_logits(
+            pred_heatmaps, target, 
+            pos_weight=torch.tensor([self.pos_weight], device=device),
+            reduction='sum'
+        )
         
-        # Exact peaks (target behaves as 1)
-        pos_inds = target.eq(1).float()
-        neg_inds = target.lt(1).float()
-        
-        neg_weights = torch.pow(1 - target, self.beta)
-        
-        loss_pos = torch.log(pred) * torch.pow(1 - pred, self.alpha) * pos_inds
-        loss_neg = torch.log(1 - pred) * torch.pow(pred, self.alpha) * neg_weights * neg_inds
-        
-        num_pos = pos_inds.sum()
-        
-        loss_pos = loss_pos.sum()
-        loss_neg = loss_neg.sum()
-        
-        if num_pos == 0:
-            loss = -loss_neg
-        else:
-            loss = -(loss_pos + loss_neg) / num_pos
-            
-        return loss
+        return loss / (B * C)

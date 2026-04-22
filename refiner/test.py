@@ -54,14 +54,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def save_refiner_visualization(image: torch.Tensor, pred: torch.Tensor, target: torch.Tensor,
-                               img_path: str, out_dir: str, input_size: int) -> None:
-    """Draws predicted (orange) and target (green) points on the full-card crop.
-    
-    Args:
-        image (torch.Tensor): [3, H, W] normalized image tensor.
-        pred (torch.Tensor): [4, 2] normalized coordinates.
-        target (torch.Tensor): [4, 2] normalized coordinates.
-    """
+                               img_path: str, out_dir: str, input_size: int, raw_peaks: torch.Tensor = None) -> None:
     try:
         import cv2
         import numpy as np
@@ -76,17 +69,33 @@ def save_refiner_visualization(image: torch.Tensor, pred: torch.Tensor, target: 
 
     corner_labels = ["TL", "TR", "BR", "BL"]
     
+    pts_pred = []
     for i in range(4):
         px_pred = (pred[i].cpu().numpy() * input_size).astype(int)
         px_target = (target[i].cpu().numpy() * input_size).astype(int)
+        pts_pred.append(px_pred)
 
         # GT green
         cv2.circle(img, tuple(px_pred), 4, (0, 165, 255), -1)   # Pred orange
         cv2.circle(img, tuple(px_target), 4, (0, 255, 0), -1)   # GT green
         
-        label = f"{i}:{corner_labels[i]}"
-        cv2.putText(img, label, (px_pred[0] + 5, px_pred[1] - 5), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        # Label Prediction
+        label_pred = f"P_{i}:{corner_labels[i]}"
+        cv2.putText(img, label_pred, (px_pred[0] + 5, px_pred[1] - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+                    
+        # Label Ground Truth
+        label_gt = f"GT_{i}:{corner_labels[i]}"
+        cv2.putText(img, label_gt, (px_target[0] + 5, px_target[1] - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                    
+        if raw_peaks is not None:
+            px_raw = (raw_peaks[i].cpu().numpy() * input_size).astype(int)
+            cv2.circle(img, tuple(px_raw), 4, (255, 0, 255), -1)   # Raw Peak Pink
+
+    # Connect predicted points
+    pts = np.array(pts_pred, np.int32).reshape((-1, 1, 2))
+    cv2.polylines(img, [pts], True, (0, 165, 255), 2)
 
     name = os.path.basename(img_path)
     cv2.imwrite(os.path.join(out_dir, f"refine_vis_{name}"), img)
@@ -153,6 +162,16 @@ def main() -> None:
             t_infer = sync_time()
             out = model(images)
             pred = out[0] if isinstance(out, (list, tuple)) else out
+            
+            raw_peaks = None
+            if isinstance(out, (list, tuple)) and len(out) > 1:
+                v_heatmaps = out[1]
+                B_v, C_v, H_v, W_v = v_heatmaps.shape
+                v_heatmaps_flat = v_heatmaps.view(B_v, C_v, -1)
+                max_idx = torch.argmax(v_heatmaps_flat, dim=-1)
+                peak_y = max_idx // W_v
+                peak_x = max_idx % W_v
+                raw_peaks = torch.stack([(peak_x.float() + 0.5) / W_v, (peak_y.float() + 0.5) / H_v], dim=-1)
             infer_time = sync_time() - t_infer
 
             total_infer_time += infer_time
@@ -190,6 +209,7 @@ def main() -> None:
                     'mean_err': dist.mean().item(),
                     'pred_norm': p_norm.cpu(),
                     'target_norm': t_norm.cpu(),
+                    'raw_peaks_norm': raw_peaks[b].cpu() if raw_peaks is not None else None,
                     'image_tensor': images[b].cpu(),
                 })
 
@@ -255,7 +275,7 @@ def main() -> None:
         for r in results_sorted:
             if drawn >= args.max_vis:
                 break
-            save_refiner_visualization(r['image_tensor'], r['pred_norm'], r['target_norm'], r['img_path'], vis_dir, args.input_size)
+            save_refiner_visualization(r['image_tensor'], r['pred_norm'], r['target_norm'], r['img_path'], vis_dir, args.input_size, raw_peaks=r.get('raw_peaks_norm'))
             drawn += 1
         logger.info(f"Saved {drawn} visualizations to: {vis_dir}")
 

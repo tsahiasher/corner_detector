@@ -54,21 +54,15 @@ class FullCardRefinerDataset(Dataset):
     def reorder_corners(pts):
         """
         Reorders corners to [TL, TR, BR, BL] based on image coordinates.
-        TL: min(x+y), TR: max(x-y), BR: max(x+y), BL: min(x-y)
+        Uses robust geometric centroid sorting.
         """
-        pts = np.array(pts)
-        s = pts.sum(axis=1)
-        # Using DIFF(x,y) = y-x. 
-        # TR: max(x-y) -> min(y-x)
-        # BL: min(x-y) -> max(y-x)
-        d = pts[:, 1] - pts[:, 0]
+        from common.geometry import sort_corners_clockwise
         
-        tl = pts[np.argmin(s)]
-        br = pts[np.argmax(s)]
-        tr = pts[np.argmin(d)]
-        bl = pts[np.argmax(d)]
+        # Convert to tensor for the geometric utility
+        pts_t = torch.tensor(pts, dtype=torch.float32)
+        sorted_t = sort_corners_clockwise(pts_t)
         
-        return np.array([tl, tr, br, bl], dtype=np.float32)
+        return sorted_t.numpy()
 
     def __getitem__(self, idx):
         img_path = self.img_paths[idx]

@@ -17,7 +17,7 @@ from refiner.models.patch_refiner import PatchRefinerNet
 from refiner.datasets.refine_keypoint_dataset import FullCardRefinerDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
-from common.metrics import calculate_accuracy_metrics, HeatmapFocalLoss
+from common.metrics import calculate_accuracy_metrics, HeatmapLoss
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.logging_utils import TrainingTracker, TopLossTracker
 from common.visualization import save_diagnostic_visualization
@@ -127,14 +127,14 @@ def main() -> None:
     n_warmup = 3
     def lr_lambda(epoch):
         if args.overfit:
-            return 1.0 # Constant learning rate in overfit mode
+            return 1.0 # Standard learning rate for overfit mode (2e-4)
         if epoch < n_warmup:
             return (epoch + 1) / n_warmup
         return 0.5 * (1 + math.cos(math.pi * (epoch - n_warmup) / (args.epochs - n_warmup)))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    focal_criterion = HeatmapFocalLoss(sigma=2.0)
+    focal_criterion = HeatmapLoss().to(device)
     
     start_epoch = 0
     best_mean_error = float('inf')
@@ -162,42 +162,48 @@ def main() -> None:
             targets = batch['targets'] # [B, 4, 2] normalized in crop
 
             optimizer.zero_grad()
-            pred_final, pred_refined1, pred_coarse, pred_heatmaps = model(images)
+            pred_final, pred_heatmaps = model(images)
             
-            # 1. Coordinate Losses
-            loss_final = F.smooth_l1_loss(pred_final, targets)
-            loss_refined1 = F.smooth_l1_loss(pred_refined1, targets)
-            loss_coarse = F.smooth_l1_loss(pred_coarse, targets)
+            # 1. Coordinate Loss (Removed in favor of pure heatmap supervision)
+            # loss_coords = F.smooth_l1_loss(pred_final, targets)
             
-            # 2. Auxiliary Diagnostic Heatmap Loss
-            # Supervise the 31x31 auxiliary head from Stride 4 features
-            B, C, H_hm, W_hm = pred_heatmaps.shape
-            # Diagnostic geometry: (31-1) / 160
-            patch_span = (H_hm - 1) / 160.0 
-            # rel_gt in [0, 1] range within the 31x31 patch
-            rel_gt = (targets - pred_coarse) / patch_span + 0.5
-            
-            # Mask for GT in-patch
-            valid_mask = (rel_gt >= 0.0) & (rel_gt <= 1.0)
-            valid_mask = valid_mask.all(dim=-1) # [B, 4]
-            
-            loss_heatmap = torch.zeros(1, device=device)
-            if valid_mask.any():
-                # [B*4, 1, 31, 31], [B*4, 1, 2]
-                v_heatmaps = pred_heatmaps.view(-1, 1, H_hm, W_hm)[valid_mask.view(-1)]
-                v_rel_gt = rel_gt.view(-1, 2)[valid_mask.view(-1)].unsqueeze(1)
-                loss_heatmap = focal_criterion(v_heatmaps, v_rel_gt)
+            # 2. Global Heatmap Loss
+            loss_heatmap = focal_criterion(pred_heatmaps, targets)
 
-            # 3. Geometric Consistency on final prediction
-            p_order = F.relu(pred_final[:, 0, 0] - pred_final[:, 1, 0])
-            p_order = p_order + F.relu(pred_final[:, 3, 0] - pred_final[:, 2, 0])
-            p_order = p_order + F.relu(pred_final[:, 0, 1] - pred_final[:, 3, 1])
-            p_order = p_order + F.relu(pred_final[:, 1, 1] - pred_final[:, 2, 1])
-            loss_geom = p_order.mean()
+            # 3. Geometric Consistency: Convexity Cross-Product Loss
+            e0 = pred_final[:, 1] - pred_final[:, 0] # TL->TR
+            e1 = pred_final[:, 2] - pred_final[:, 1] # TR->BR
+            e2 = pred_final[:, 3] - pred_final[:, 2] # BR->BL
+            e3 = pred_final[:, 0] - pred_final[:, 3] # BL->TL
+            
+            # Cross product (2D): x1*y2 - y1*x2. Should be consistently positive.
+            # In image coordinates (Y down), TL->TR->BR->BL order yields positive cross products.
+            c0 = e0[:,0]*e1[:,1] - e0[:,1]*e1[:,0]
+            c1 = e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0]
+            c2 = e2[:,0]*e3[:,1] - e2[:,1]*e3[:,0]
+            c3 = e3[:,0]*e0[:,1] - e3[:,1]*e0[:,0]
+            loss_convex = (F.relu(-c0) + F.relu(-c1) + F.relu(-c2) + F.relu(-c3)).mean()
 
-            # The focal loss is a sum over SxS spatial pixels, so its native magnitude is ~S*S (e.g. 400+). 
-            # We scale it down to balance with the smooth_l1_loss (~0.1).
-            loss = 1.0 * loss_final + 0.5 * loss_refined1 + 0.3 * loss_coarse + 0.05 * loss_heatmap + 0.1 * loss_geom
+            # 4. Corner Separation Loss
+            # Penalize any two corners closer than 0.1 normalized units
+            dist_matrix = torch.cdist(pred_final, pred_final) # [B, 4, 4]
+            mask = torch.eye(4, dtype=torch.bool, device=dist_matrix.device).unsqueeze(0)
+            # Fill diagonal with large value so it's not penalized
+            dist_matrix = dist_matrix.masked_fill(mask, 999.0)
+            loss_sep = F.relu(0.1 - dist_matrix).mean()
+
+            # 1. Heatmap Loss (Primary localization signal)
+            loss_heatmap = focal_criterion(pred_heatmaps, targets)
+            
+            # 2. Coordinate L1 Loss (Guides the model to correct ordering)
+            # This prevents the peaks from getting stuck in wrong corners.
+            loss_coords = F.smooth_l1_loss(pred_final, targets)
+            
+            # 3. Geometric Losses (Refines the quad shape)
+            loss = (1.0 * loss_heatmap + 
+                    1.0 * loss_coords + 
+                    0.05 * loss_convex + 
+                    0.05 * loss_sep)
             
             loss.backward()
             optimizer.step()
@@ -210,8 +216,7 @@ def main() -> None:
                 avg_pw_dist = torch.stack(pw_dists).mean().item()
 
             tracker.record_batch('train', loss.item(), sync_time() - batch_start, 
-                                 components={'final': loss_final.item(), 
-                                             'coarse': loss_coarse.item(),
+                                 components={'heatmap': loss_heatmap.item(),
                                              'pw_dist': avg_pw_dist})
             train_pbar.set_postfix({'loss': f"{loss.item():.5f}"})
         
@@ -233,21 +238,38 @@ def main() -> None:
                 targets = batch['targets']
                 meta = batch['metadata']
                 
-                v_final, v_refined1, v_coarse, v_heatmaps = model(images)
-                v_loss_final = F.smooth_l1_loss(v_final, targets)
-                v_loss_refined1 = F.smooth_l1_loss(v_refined1, targets)
-                v_loss_coarse = F.smooth_l1_loss(v_coarse, targets)
+                v_final, v_heatmaps = model(images)
+                # v_loss_coords = F.smooth_l1_loss(v_final, targets)
+                v_loss_heatmap = focal_criterion(v_heatmaps, targets)
                 
-                # Geometric Consistency
-                po = F.relu(v_final[:, 0, 0] - v_final[:, 1, 0])
-                po = po + F.relu(v_final[:, 3, 0] - v_final[:, 2, 0])
-                po = po + F.relu(v_final[:, 0, 1] - v_final[:, 3, 1])
-                po = po + F.relu(v_final[:, 1, 1] - v_final[:, 2, 1])
-                v_loss_geom = po.mean()
+                # 3. Geometric Consistency: Convexity Cross-Product Loss
+                e0 = v_final[:, 1] - v_final[:, 0]
+                e1 = v_final[:, 2] - v_final[:, 1]
+                e2 = v_final[:, 3] - v_final[:, 2]
+                e3 = v_final[:, 0] - v_final[:, 3]
+                c0 = e0[:,0]*e1[:,1] - e0[:,1]*e1[:,0]
+                c1 = e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0]
+                c2 = e2[:,0]*e3[:,1] - e2[:,1]*e3[:,0]
+                c3 = e3[:,0]*e0[:,1] - e3[:,1]*e0[:,0]
+                v_loss_convex = (F.relu(-c0) + F.relu(-c1) + F.relu(-c2) + F.relu(-c3)).mean()
 
-                v_loss = 1.0 * v_loss_final + 0.5 * v_loss_refined1 + 0.3 * v_loss_coarse + 0.1 * v_loss_geom
+                # 4. Corner Separation Loss
+                dist_matrix = torch.cdist(v_final, v_final)
+                mask = torch.eye(4, dtype=torch.bool, device=dist_matrix.device).unsqueeze(0)
+                dist_matrix = dist_matrix.masked_fill(mask, 999.0)
+                v_loss_sep = F.relu(0.1 - dist_matrix).mean()
+
+                v_loss = 1.0 * v_loss_heatmap + 0.1 * v_loss_convex + 0.05 * v_loss_sep
                 losses.append(v_loss.item())
                 val_preds.append(v_final.detach().cpu())
+                
+                # Compute raw peaks for visualization
+                B_v, C_v, H_v, W_v = v_heatmaps.shape
+                v_heatmaps_flat = v_heatmaps.view(B_v, C_v, -1)
+                max_idx = torch.argmax(v_heatmaps_flat, dim=-1)
+                peak_y = max_idx // W_v
+                peak_x = max_idx % W_v
+                raw_peaks = torch.stack([(peak_x.float() + 0.5) / W_v, (peak_y.float() + 0.5) / H_v], dim=-1)
                 
                 # EXACT Inverse Mapping to Original Pixel Coordinates
                 B = v_final.size(0)
@@ -280,8 +302,8 @@ def main() -> None:
                     top_tracker.update(dist.mean().item(), {
                         'image': images[b],
                         'pred': p_norm,
-                        'coarse': v_coarse[b],
                         'gt': t_norm,
+                        'raw_peaks': raw_peaks[b].cpu(),
                         'path': batch['img_path'][b]
                     })
 
@@ -315,13 +337,14 @@ def main() -> None:
         scheduler.step()
 
         # Save Visualizations for Top Losses
+        from refiner.test import save_refiner_visualization
         epoch_vis_dir = os.path.join(vis_dir, f"epoch_{epoch+1:03d}")
+        os.makedirs(epoch_vis_dir, exist_ok=True)
         for sample in top_tracker.get_samples():
-            save_diagnostic_visualization(
+            save_refiner_visualization(
                 sample['image'], sample['pred'], sample['gt'],
-                None, None,
                 sample['path'], epoch_vis_dir,
-                secondary_corners=sample['coarse']
+                args.input_size, raw_peaks=sample['raw_peaks']
             )
         
         # Checkpoints based on Mean Error
