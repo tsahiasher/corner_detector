@@ -6,6 +6,7 @@ import argparse
 import logging
 import json
 import math
+import random
 from datetime import datetime
 import torch
 import torch.nn as nn
@@ -156,6 +157,17 @@ def main() -> None:
         tracker.start_epoch()
         current_lr = optimizer.param_groups[0]['lr']
 
+        # ROI Scheduling: 100% GT for epochs 0-15, linear decay to 0% by epoch 35
+        # Overfit mode: Always 100% GT
+        if args.overfit:
+            gt_roi_prob = 1.0
+        elif epoch < 15:
+            gt_roi_prob = 1.0
+        elif epoch > 35:
+            gt_roi_prob = 0.0
+        else:
+            gt_roi_prob = 1.0 - (epoch - 15) / (35 - 15)
+
         # === Training ===
         model.train()
         tracker.start_train_phase()
@@ -167,11 +179,10 @@ def main() -> None:
             targets = batch['targets'] # [B, 4, 2] normalized in crop
 
             optimizer.zero_grad()
-            # pred_coarse, pred_refined: [B, 4, 2] in full input space (Crop)
-            # pred_heatmaps: [B, 4, 112, 112] in RoI space
-            # roi_boxes: the RoI actually used for training (GT-based)
-            # pred_roi_boxes: what the model would have used at inference
-            pred_coarse, pred_refined, pred_heatmaps, roi_boxes, pred_roi_boxes = model(images, gt_pts=targets)
+            # pred_coarse, pred_refined, pred_heatmaps, roi_boxes, pred_roi_boxes: [B, 4, 2]
+            # Stochastic ROI choice for robustness
+            use_gt = random.random() < gt_roi_prob
+            pred_coarse, pred_refined, pred_heatmaps, roi_boxes, pred_roi_boxes = model(images, gt_pts=targets if use_gt else None)
 
             # 1. Coarse Loss
             loss_coarse = F.smooth_l1_loss(pred_coarse, targets)
@@ -207,7 +218,8 @@ def main() -> None:
 
         # === Validation ===
         model.eval()
-        errors = []
+        errors_refined = []
+        errors_coarse = []
         losses = []
         val_preds = []
         top_tracker = TopLossTracker(k=min(5, len(val_dataset)))
@@ -284,12 +296,15 @@ def main() -> None:
                         return torch.stack([kx + px1, ky + py1], dim=-1)
 
                     p_orig = inverse_map(p_norm)
+                    pc_orig = inverse_map(p_coarse)
                     t_orig = inverse_map(t_norm)
                     
-                    dist = torch.norm(p_orig - t_orig, dim=-1) # [4] pixels
-                    errors.append(dist.cpu())
+                    dist_refined = torch.norm(p_orig - t_orig, dim=-1) # [4] pixels
+                    dist_coarse = torch.norm(pc_orig - t_orig, dim=-1)
+                    errors_refined.append(dist_refined.cpu())
+                    errors_coarse.append(dist_coarse.cpu())
                     
-                    top_tracker.update(dist.mean().item(), {
+                    top_tracker.update(dist_refined.mean().item(), {
                         'image': images[b],
                         'pred': p_norm,
                         'pred_coarse': p_coarse,
@@ -302,19 +317,22 @@ def main() -> None:
                     })
 
             
-        all_errors = torch.cat(errors, dim=0)
-        metrics = calculate_accuracy_metrics(all_errors)
+        all_errors_refined = torch.cat(errors_refined, dim=0)
+        all_errors_coarse = torch.cat(errors_coarse, dim=0)
+        metrics_refined = calculate_accuracy_metrics(all_errors_refined)
+        metrics_coarse = calculate_accuracy_metrics(all_errors_coarse)
         avg_val_loss = sum(losses) / len(losses)
         
         # Logging Summary Table
-        logger.info(f"LR: {current_lr:.6f} | Size: {args.input_size}")
-        header = f"{'Phase':<15} | {'Loss':<10} | {'Mean (px)':<10} | {'<1px (%)':<10} | {'<2px (%)':<10} | {'<3px (%)':<10}"
+        logger.info(f"LR: {current_lr:.6f} | GT ROI Prob: {gt_roi_prob:.2f} | Size: {args.input_size}")
+        header = f"{'Phase':<15} | {'Loss':<10} | {'Coarse (px)':<12} | {'Refined (px)':<12} | {'<1px (%)':<10} | {'<2px (%)':<10} | {'<3px (%)':<10}"
         logger.info("-" * len(header))
         logger.info(header)
         logger.info("-" * len(header))
-        logger.info(f"{'Train':<15} | {avg_train_loss:<10.5f} | {'-':<10} | {'-':<10} | {'-':<10} | {'-':<10}")
-        fmt = lambda m, l: f"{l:<10.5f} | {m['mean']:<10.3f} | {m['acc_1px']:<10.1f} | {m['acc_2px']:<10.1f} | {m['acc_3px']:<10.1f}"
-        logger.info(f"{'Validation':<15} | " + fmt(metrics, avg_val_loss))
+        logger.info(f"{'Train':<15} | {avg_train_loss:<10.5f} | {'-':<12} | {'-':<12} | {'-':<10} | {'-':<10} | {'-':<10}")
+        
+        fmt = lambda m_ref, m_crs, l: f"{l:<10.5f} | {m_crs['mean']:<12.3f} | {m_ref['mean']:<12.3f} | {m_ref['acc_1px']:<10.1f} | {m_ref['acc_2px']:<10.1f} | {m_ref['acc_3px']:<10.1f}"
+        logger.info(f"{'Validation':<15} | " + fmt(metrics_refined, metrics_coarse, avg_val_loss))
         logger.info("-" * len(header))
         
         scheduler.step()
@@ -331,12 +349,12 @@ def main() -> None:
                     pred_roi_box=sample.get('pred_roi_box')
                 )
         
-        # Checkpoints based on Mean Error
+        # Checkpoints based on Mean Error (Refined)
         latest_path = os.path.join(run_dir, 'checkpoints', 'last.pt')
-        save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics['mean'], latest_path)
+        save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics_refined['mean'], latest_path)
         
-        if metrics['mean'] < best_mean_error:
-            best_mean_error = metrics['mean']
+        if metrics_refined['mean'] < best_mean_error:
+            best_mean_error = metrics_refined['mean']
             best_path = os.path.join(run_dir, 'checkpoints', 'best.pt')
             save_checkpoint(model, optimizer, scheduler, epoch + 1, best_mean_error, best_path)
             logger.info(f"New best model: {best_path} (mean_err={best_mean_error:.3f})")
