@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from common.metrics import SoftArgmax2D
 
+
 class ConvBNReLU(nn.Module):
     def __init__(self, in_planes, out_planes, stride=1, groups=1):
         super().__init__()
@@ -25,7 +26,7 @@ class FullCardRefinerNet(nn.Module):
     def __init__(self, input_size=640, patch_size=7):
         super().__init__()
         self.input_size = input_size
-        self.patch_size = patch_size
+        self.patch_size = patch_size # Step 1 Regression Patch Size (7x7 at Stride 8 = 56px)
         
         # 1. Backbone: Stride 4 -> 8 -> 16 -> 32
         self.stem = nn.Sequential(
@@ -59,15 +60,38 @@ class FullCardRefinerNet(nn.Module):
             nn.Sigmoid() 
         )
         
-        # 3. Local Refine Head: Shared for 4 patches [128, 7, 7]
+        # 3. Local Refine Head 1: Shared for 4 patches [128, 7, 7]
         self.local_head = nn.Sequential(
-            ConvBNReLU(128, 64, stride=1), # 7-2=5 (no pad) or use pad=1
+            ConvBNReLU(128, 64, stride=1),
             ConvBNReLU(64, 64, stride=1),  
             nn.Flatten(),
             nn.Linear(64 * 7 * 7, 128),
             nn.ReLU6(inplace=True),
             nn.Linear(128, 2), # 2D residual (dx, dy)
             nn.Tanh() # Bounded [-1, 1]
+        )
+        
+        # 3.1 Auxiliary Diagnostic Heatmap Head: Larger patches [128, 31, 31]
+        self.heatmap_patch_size = 31
+        self.aux_heatmap_head = nn.Sequential(
+            ConvBNReLU(128, 64, stride=1),
+            ConvBNReLU(64, 64, stride=1),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1)
+        )
+        
+        # 4. Fusion Layer for high-resolution refinement [128+64 -> 128]
+        self.fine_fusion = ConvBNReLU(128 + 64, 128, stride=1)
+        
+        # 5. Local Refine Head 2: Smaller patches [128, 5, 5]
+        self.patch_size_2 = 5
+        self.local_head_2 = nn.Sequential(
+            ConvBNReLU(128, 64, stride=1),
+            ConvBNReLU(64, 64, stride=1),
+            nn.Flatten(),
+            nn.Linear(64 * 5 * 5, 64),
+            nn.ReLU6(inplace=True),
+            nn.Linear(64, 2),
+            nn.Tanh()
         )
         
         # Initialization
@@ -81,7 +105,7 @@ class FullCardRefinerNet(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.constant_(m.bias, 0)
 
-    def extract_local_patches(self, features, coords):
+    def extract_local_patches(self, features, coords, p_size=None):
         """
         Differentiable sampling of local patches around predicted coords.
         Args:
@@ -91,7 +115,7 @@ class FullCardRefinerNet(nn.Module):
             patches: [B*4, C, S, S]
         """
         B, C, Hf, Wf = features.size()
-        S = self.patch_size
+        S = p_size if p_size is not None else self.patch_size
         device = features.device
         
         # 1. Map [0, 1] to [-1, 1] for grid_sample
@@ -137,18 +161,27 @@ class FullCardRefinerNet(nn.Module):
         # Step 1: Coarse Prediction [B, 4, 2]
         coarse = self.coarse_head(f3).view(B, 4, 2)
         
-        # Step 2: Differentiable Sampling of Local Patches [B*4, C, 7, 7]
-        patches = self.extract_local_patches(f1, coarse)
+        # Step 2: First Residual Refinement (Regression, Stride 8, 7x7)
+        # Restore Phase 1 to stable regression path
+        patches1 = self.extract_local_patches(f1, coarse, p_size=self.patch_size)
+        res1 = self.local_head(patches1).view(B, 4, 2)
+        refined1 = torch.clamp(coarse + res1 * 0.1, 0.0, 1.0)
         
-        # Step 3: Local Refinement Head -> 2D residuals (dx, dy)
-        res_raw = self.local_head(patches) # [B*4, 2]
-        residuals = res_raw.view(B, 4, 2)
+        # Construct Stride 4 Fine Feature Map (160x160) for Stage 2 & Auxiliary Head
+        up_f1 = F.interpolate(f1, scale_factor=2, mode='bilinear', align_corners=False)
+        f_fine = self.fine_fusion(torch.cat([up_f1, s], dim=1))
         
-        # Scale residuals: 0.1 (64 pixels in 640px image)
-        final = coarse + residuals * 0.1
-        final = torch.clamp(final, 0.0, 1.0)
+        # Auxiliary Path: Diagnostic heatmap from separate large patches (Stride 4, 31x31)
+        # Detach features/coordinates to isolate gradients from the main regression model
+        hm_patches = self.extract_local_patches(f_fine.detach(), coarse.detach(), p_size=self.heatmap_patch_size)
+        aux_heatmaps = self.aux_heatmap_head(hm_patches) # [B*4, 1, 31, 31]
         
-        return final, coarse
+        # Step 3: Second Residual Refinement (Regression, Stride 4, 5x5)
+        patches2 = self.extract_local_patches(f_fine, refined1, p_size=self.patch_size_2)
+        res2 = self.local_head_2(patches2).view(B, 4, 2)
+        final = torch.clamp(refined1 + res2 * 0.05, 0.0, 1.0)
+        
+        return final, refined1, coarse, aux_heatmaps.view(B, 4, self.heatmap_patch_size, self.heatmap_patch_size)
 
 # Compatibility alias
 FullCardCornerNet = FullCardRefinerNet

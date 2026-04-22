@@ -10,14 +10,14 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from refiner.models.patch_refiner import PatchRefinerNet
 from refiner.datasets.refine_keypoint_dataset import FullCardRefinerDataset
 from common.checkpoint import save_checkpoint, load_checkpoint
 from common.seed import set_seed
-from common.metrics import HeatmapFocalLoss, calculate_accuracy_metrics
+from common.metrics import calculate_accuracy_metrics, HeatmapFocalLoss
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.logging_utils import TrainingTracker, TopLossTracker
 from common.visualization import save_diagnostic_visualization
@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--name', type=str, default='', help="Optional suffix for the run directory.")
     parser.add_argument('--num_workers', type=int, default=4, help="Number of data loading workers.")
     parser.add_argument('--resume', type=str, default='', help="Path to checkpoint to resume from.")
+    parser.add_argument('--overfit', action='store_true', help="Filter and train on exactly 10 clean samples to verify convergence.")
     add_device_args(parser, default='auto')
     return parser.parse_args()
 
@@ -86,7 +87,34 @@ def main() -> None:
     train_dataset = FullCardRefinerDataset(args.train_images, input_size=args.input_size, margin_ratio=args.margin_ratio)
     val_dataset = FullCardRefinerDataset(args.val_images, input_size=args.input_size, margin_ratio=args.margin_ratio)
 
-    
+    if args.overfit:
+        logger.info("=" * 80)
+        logger.info(" OVERFIT MODE ".center(80, "="))
+        indices = []
+        for i, lbl in enumerate(train_dataset.labels):
+            if lbl and 'keypoints' in lbl:
+                kpts = lbl['keypoints']
+                # Check if all 4 corners are well centered [0.1, 0.9]
+                if all(0.1 < k[0] < 0.9 and 0.1 < k[1] < 0.9 for k in kpts):
+                    indices.append(i)
+            if len(indices) >= 10:
+                break
+        
+        if not indices:
+            logger.warning("OVERFIT MODE: No well-centered samples found. Falling back to first 10 valid samples.")
+            indices = list(range(min(10, len(train_dataset))))
+        elif len(indices) < 10:
+            logger.warning(f"OVERFIT MODE: Only found {len(indices)} well-centered samples.")
+
+        logger.info(f"OVERFIT MODE: Selected {len(indices)} samples.")
+        logger.info(f"OVERFIT MODE: Selected indices: {indices}")
+        logger.info("OVERFIT MODE: Validation set will use the same subset for verification.")
+        
+        train_dataset = Subset(train_dataset, indices)
+        val_dataset = train_dataset
+        args.batch_size = min(args.batch_size, len(indices))
+        logger.info("=" * 80)
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
@@ -98,6 +126,8 @@ def main() -> None:
     # Scheduler with warmup
     n_warmup = 3
     def lr_lambda(epoch):
+        if args.overfit:
+            return 1.0 # Constant learning rate in overfit mode
         if epoch < n_warmup:
             return (epoch + 1) / n_warmup
         return 0.5 * (1 + math.cos(math.pi * (epoch - n_warmup) / (args.epochs - n_warmup)))
@@ -132,20 +162,42 @@ def main() -> None:
             targets = batch['targets'] # [B, 4, 2] normalized in crop
 
             optimizer.zero_grad()
-            pred_final, pred_coarse = model(images)
+            pred_final, pred_refined1, pred_coarse, pred_heatmaps = model(images)
             
-            # Loss = 1.0 * final_loss + 0.3 * coarse_loss + 0.1 * geom_loss
+            # 1. Coordinate Losses
             loss_final = F.smooth_l1_loss(pred_final, targets)
+            loss_refined1 = F.smooth_l1_loss(pred_refined1, targets)
             loss_coarse = F.smooth_l1_loss(pred_coarse, targets)
             
-            # Geometric Consistency on final prediction
+            # 2. Auxiliary Diagnostic Heatmap Loss
+            # Supervise the 31x31 auxiliary head from Stride 4 features
+            B, C, H_hm, W_hm = pred_heatmaps.shape
+            # Diagnostic geometry: (31-1) / 160
+            patch_span = (H_hm - 1) / 160.0 
+            # rel_gt in [0, 1] range within the 31x31 patch
+            rel_gt = (targets - pred_coarse) / patch_span + 0.5
+            
+            # Mask for GT in-patch
+            valid_mask = (rel_gt >= 0.0) & (rel_gt <= 1.0)
+            valid_mask = valid_mask.all(dim=-1) # [B, 4]
+            
+            loss_heatmap = torch.zeros(1, device=device)
+            if valid_mask.any():
+                # [B*4, 1, 31, 31], [B*4, 1, 2]
+                v_heatmaps = pred_heatmaps.view(-1, 1, H_hm, W_hm)[valid_mask.view(-1)]
+                v_rel_gt = rel_gt.view(-1, 2)[valid_mask.view(-1)].unsqueeze(1)
+                loss_heatmap = focal_criterion(v_heatmaps, v_rel_gt)
+
+            # 3. Geometric Consistency on final prediction
             p_order = F.relu(pred_final[:, 0, 0] - pred_final[:, 1, 0])
             p_order = p_order + F.relu(pred_final[:, 3, 0] - pred_final[:, 2, 0])
             p_order = p_order + F.relu(pred_final[:, 0, 1] - pred_final[:, 3, 1])
             p_order = p_order + F.relu(pred_final[:, 1, 1] - pred_final[:, 2, 1])
             loss_geom = p_order.mean()
 
-            loss = 1.0 * loss_final + 0.3 * loss_coarse + 0.1 * loss_geom
+            # The focal loss is a sum over SxS spatial pixels, so its native magnitude is ~S*S (e.g. 400+). 
+            # We scale it down to balance with the smooth_l1_loss (~0.1).
+            loss = 1.0 * loss_final + 0.5 * loss_refined1 + 0.3 * loss_coarse + 0.05 * loss_heatmap + 0.1 * loss_geom
             
             loss.backward()
             optimizer.step()
@@ -171,7 +223,7 @@ def main() -> None:
         errors = []
         losses = []
         val_preds = []
-        top_tracker = TopLossTracker(k=5)
+        top_tracker = TopLossTracker(k=min(5, len(val_dataset)))
         
         val_pbar = tqdm(val_loader, desc=f"Validation", leave=False)
         with torch.no_grad():
@@ -181,8 +233,9 @@ def main() -> None:
                 targets = batch['targets']
                 meta = batch['metadata']
                 
-                v_final, v_coarse = model(images)
+                v_final, v_refined1, v_coarse, v_heatmaps = model(images)
                 v_loss_final = F.smooth_l1_loss(v_final, targets)
+                v_loss_refined1 = F.smooth_l1_loss(v_refined1, targets)
                 v_loss_coarse = F.smooth_l1_loss(v_coarse, targets)
                 
                 # Geometric Consistency
@@ -192,7 +245,7 @@ def main() -> None:
                 po = po + F.relu(v_final[:, 1, 1] - v_final[:, 2, 1])
                 v_loss_geom = po.mean()
 
-                v_loss = 1.0 * v_loss_final + 0.3 * v_loss_coarse + 0.1 * v_loss_geom
+                v_loss = 1.0 * v_loss_final + 0.5 * v_loss_refined1 + 0.3 * v_loss_coarse + 0.1 * v_loss_geom
                 losses.append(v_loss.item())
                 val_preds.append(v_final.detach().cpu())
                 

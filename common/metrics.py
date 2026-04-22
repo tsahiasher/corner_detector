@@ -457,10 +457,12 @@ class HeatmapFocalLoss(nn.Module):
         
         # Gaussian anchors MUST be placed EXACTLY at integer coordinate bounds
         # Otherwise target.eq(1) fails across the floating-point gap, suppressing all positive gradients!
-        gt_px = gt_corners.view(B, C, 1, 1, 2) * torch.tensor([W, H], device=device, dtype=torch.float32).view(1, 1, 1, 1, 2)
-        gt_px_int = torch.floor(gt_px)
-        gt_px_int[..., 0] = torch.clamp(gt_px_int[..., 0], 0, W - 1)
-        gt_px_int[..., 1] = torch.clamp(gt_px_int[..., 1], 0, H - 1)
+        # Map [0, 1] normalized to [0, W-1] pixel indices
+        gt_px = gt_corners.view(B, C, 1, 1, 2) * torch.tensor([W - 1, H - 1], device=device, dtype=torch.float32).view(1, 1, 1, 1, 2)
+        gt_px_int = torch.round(gt_px)
+        # Avoid in-place assignments to prevent autograd errors
+        max_bounds = torch.tensor([W - 1, H - 1], device=device, dtype=torch.float32).view(1, 1, 1, 1, 2)
+        gt_px_int = torch.clamp(gt_px_int, torch.zeros_like(max_bounds), max_bounds)
         
         dist_sq = torch.sum((grid.view(1, 1, H, W, 2) - gt_px_int) ** 2, dim=-1)
         target = torch.exp(-dist_sq / (2 * self.sigma ** 2))

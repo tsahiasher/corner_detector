@@ -151,7 +151,8 @@ def main() -> None:
 
             B = images.size(0)
             t_infer = sync_time()
-            pred, _ = model(images) # Extract final refined prediction from 2-output model
+            out = model(images)
+            pred = out[0] if isinstance(out, (list, tuple)) else out
             infer_time = sync_time() - t_infer
 
             total_infer_time += infer_time
