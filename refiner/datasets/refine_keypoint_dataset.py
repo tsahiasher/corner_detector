@@ -13,9 +13,13 @@ class FullCardRefinerDataset(Dataset):
     Target Coordinate Convention:
     - Points are normalized [0, 1] relative to the CROPPED image bounds.
     """
-    def __init__(self, image_dir, input_size=256, margin_ratio=0.15):
+    def __init__(self, image_dir, input_size=(320, 192), margin_ratio=0.15):
         self.image_dir = image_dir
-        self.input_size = input_size
+        # input_size can be a single int (square) or (w, h) tuple
+        if isinstance(input_size, int):
+            self.input_size = (input_size, input_size)
+        else:
+            self.input_size = input_size
         self.margin_ratio = margin_ratio
         
         # Load image paths and labels
@@ -77,7 +81,7 @@ class FullCardRefinerDataset(Dataset):
         except (UnidentifiedImageError, OSError):
             return self.__getitem__((idx + 1) % len(self))
             
-        # 1. Crop calculations
+        # 1. Crop calculations (Tight RoI around Stage 1 BBOX)
         mw = w * self.margin_ratio
         mh = h * self.margin_ratio
         
@@ -95,39 +99,29 @@ class FullCardRefinerDataset(Dataset):
         crop_w = px2 - px1
         crop_h = py2 - py1
         
-        # 2. Isotropic resize
-        scale = self.input_size / max(crop_w, crop_h)
-        new_w = int(round(crop_w * scale))
-        new_h = int(round(crop_h * scale))
-        
+        # 2. Direct rectangular resize (No Padding)
+        # This mimics RoIAlign/RoIPool by stretching the RoI to a fixed resolution.
         crop = image_pil.crop((px1, py1, px2, py2))
-        crop_resized = crop.resize((new_w, new_h), Image.BILINEAR)
+        full_input = crop.resize(self.input_size, Image.BILINEAR)
         
-        # 3. Padding to square
-        pad_x = (self.input_size - new_w) // 2
-        pad_y = (self.input_size - new_h) // 2
-        
-        full_input = Image.new("RGB", (self.input_size, self.input_size), (0, 0, 0))
-        full_input.paste(crop_resized, (pad_x, pad_y))
-        
-        # 4. Normalize image
+        # 3. Normalize image
         img_np = np.array(full_input)
         img_t = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         img_t = (img_t - mean) / std
         
-        # 5. Transform Corners to Padded Input Space [0, 1]
-        # gt_kpts are normalized [0, 1] in original image space
+        # 4. Transform Corners to RoI Space [0, 1]
+        # Coordinates are relative to the RoI bounds.
         transformed_kpts = []
         for kx, ky in gt_kpts:
-            # Shift by crop origin
+            # Shift by RoI origin
             kx_c = kx * orig_w - px1
             ky_c = ky * orig_h - py1
             
-            # Scale and Shift by padding
-            kx_final = (kx_c * scale + pad_x) / self.input_size
-            ky_final = (ky_c * scale + pad_y) / self.input_size
+            # Normalize by RoI dimensions
+            kx_final = kx_c / crop_w
+            ky_final = ky_c / crop_h
             transformed_kpts.append([kx_final, ky_final])
             
         ordered_kpts = self.reorder_corners(transformed_kpts)
@@ -138,8 +132,6 @@ class FullCardRefinerDataset(Dataset):
             'img_path': img_path,
             'metadata': {
                 'crop_box': torch.tensor([px1, py1, px2, py2], dtype=torch.float32),
-                'scale': torch.tensor(scale, dtype=torch.float32),
-                'padding': torch.tensor([pad_x, pad_y], dtype=torch.float32),
                 'input_size': torch.tensor(self.input_size, dtype=torch.float32)
             }
         }

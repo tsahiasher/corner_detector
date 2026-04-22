@@ -451,16 +451,12 @@ class HeatmapLoss(nn.Module):
         grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
         grid = torch.stack([grid_x, grid_y], dim=-1) # [H, W, 2]
         
-        # Gaussian anchors MUST be placed EXACTLY at integer coordinate bounds
-        # Otherwise target.eq(1) fails across the floating-point gap, suppressing all positive gradients!
+        # Gaussian anchors MUST be placed EXACTLY at integer coordinate bounds for Focal Loss Eq(1) behavior
+        # BUT for MSE/BCE continuous supervision, we use sub-pixel centers to avoid discretization error.
         # Map [0, 1] normalized to [0, W-1] pixel indices
         gt_px = gt_corners.view(B, C, 1, 1, 2) * torch.tensor([W - 1, H - 1], device=device, dtype=torch.float32).view(1, 1, 1, 1, 2)
-        gt_px_int = torch.round(gt_px)
-        # Avoid in-place assignments to prevent autograd errors
-        max_bounds = torch.tensor([W - 1, H - 1], device=device, dtype=torch.float32).view(1, 1, 1, 1, 2)
-        gt_px_int = torch.clamp(gt_px_int, torch.zeros_like(max_bounds), max_bounds)
         
-        dist_sq = torch.sum((grid.view(1, 1, H, W, 2) - gt_px_int) ** 2, dim=-1)
+        dist_sq = torch.sum((grid.view(1, 1, H, W, 2) - gt_px) ** 2, dim=-1)
         target = torch.exp(-dist_sq / (2 * self.sigma ** 2))
         
         # 2. Weighted BCE Loss (on raw logits)

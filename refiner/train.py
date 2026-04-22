@@ -20,7 +20,7 @@ from common.seed import set_seed
 from common.metrics import calculate_accuracy_metrics, HeatmapLoss
 from common.device import add_device_args, resolve_device, log_device_info, move_batch_to_device, sync_time
 from common.logging_utils import TrainingTracker, TopLossTracker
-from common.visualization import save_diagnostic_visualization
+from common.visualization import save_diagnostic_visualization, save_refiner_global_debug
 
 
 def setup_logging(log_file: str) -> logging.Logger:
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs.")
     parser.add_argument('--batch_size', type=int, default=8, help="Training batch size.")
     parser.add_argument('--lr', type=float, default=2e-4, help="Initial learning rate.")
-    parser.add_argument('--input_size', type=int, default=640, help="Input size for the network.")
+    parser.add_argument('--input_size', type=str, default='320,192', help="Input size for the network as 'W,H'.")
     parser.add_argument('--margin_ratio', type=float, default=0.15, help="Margin to expand Stage 1 BBOX.")
     parser.add_argument('--runs_dir', type=str, default='./refiner/runs', help="Base directory for training runs.")
     parser.add_argument('--name', type=str, default='', help="Optional suffix for the run directory.")
@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Parse input_size "W,H"
+    if ',' in args.input_size:
+        args.input_size = tuple(map(int, args.input_size.split(',')))
+    else:
+        args.input_size = int(args.input_size)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{timestamp}_{args.name}" if args.name else timestamp
     run_dir = os.path.join(args.runs_dir, run_name)
@@ -163,47 +168,27 @@ def main() -> None:
 
             optimizer.zero_grad()
             pred_final, pred_heatmaps = model(images)
-            
-            # 1. Coordinate Loss (Removed in favor of pure heatmap supervision)
-            # loss_coords = F.smooth_l1_loss(pred_final, targets)
-            
-            # 2. Global Heatmap Loss
-            loss_heatmap = focal_criterion(pred_heatmaps, targets)
 
-            # 3. Geometric Consistency: Convexity Cross-Product Loss
-            e0 = pred_final[:, 1] - pred_final[:, 0] # TL->TR
-            e1 = pred_final[:, 2] - pred_final[:, 1] # TR->BR
-            e2 = pred_final[:, 3] - pred_final[:, 2] # BR->BL
-            e3 = pred_final[:, 0] - pred_final[:, 3] # BL->TL
-            
-            # Cross product (2D): x1*y2 - y1*x2. Should be consistently positive.
-            # In image coordinates (Y down), TL->TR->BR->BL order yields positive cross products.
+            loss_heatmap = focal_criterion(pred_heatmaps, targets)
+            loss_coords = F.smooth_l1_loss(pred_final, targets)
+
+            e0 = pred_final[:, 1] - pred_final[:, 0]
+            e1 = pred_final[:, 2] - pred_final[:, 1]
+            e2 = pred_final[:, 3] - pred_final[:, 2]
+            e3 = pred_final[:, 0] - pred_final[:, 3]
+
             c0 = e0[:,0]*e1[:,1] - e0[:,1]*e1[:,0]
             c1 = e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0]
             c2 = e2[:,0]*e3[:,1] - e2[:,1]*e3[:,0]
             c3 = e3[:,0]*e0[:,1] - e3[:,1]*e0[:,0]
             loss_convex = (F.relu(-c0) + F.relu(-c1) + F.relu(-c2) + F.relu(-c3)).mean()
 
-            # 4. Corner Separation Loss
-            # Penalize any two corners closer than 0.1 normalized units
-            dist_matrix = torch.cdist(pred_final, pred_final) # [B, 4, 4]
+            dist_matrix = torch.cdist(pred_final, pred_final)
             mask = torch.eye(4, dtype=torch.bool, device=dist_matrix.device).unsqueeze(0)
-            # Fill diagonal with large value so it's not penalized
             dist_matrix = dist_matrix.masked_fill(mask, 999.0)
             loss_sep = F.relu(0.1 - dist_matrix).mean()
 
-            # 1. Heatmap Loss (Primary localization signal)
-            loss_heatmap = focal_criterion(pred_heatmaps, targets)
-            
-            # 2. Coordinate L1 Loss (Guides the model to correct ordering)
-            # This prevents the peaks from getting stuck in wrong corners.
-            loss_coords = F.smooth_l1_loss(pred_final, targets)
-            
-            # 3. Geometric Losses (Refines the quad shape)
-            loss = (1.0 * loss_heatmap + 
-                    1.0 * loss_coords + 
-                    0.05 * loss_convex + 
-                    0.05 * loss_sep)
+            loss = loss_heatmap + loss_coords + 0.05 * loss_convex + 0.05 * loss_sep
             
             loss.backward()
             optimizer.step()
@@ -239,27 +224,26 @@ def main() -> None:
                 meta = batch['metadata']
                 
                 v_final, v_heatmaps = model(images)
-                # v_loss_coords = F.smooth_l1_loss(v_final, targets)
                 v_loss_heatmap = focal_criterion(v_heatmaps, targets)
-                
-                # 3. Geometric Consistency: Convexity Cross-Product Loss
+                v_loss_coords = F.smooth_l1_loss(v_final, targets)
+
                 e0 = v_final[:, 1] - v_final[:, 0]
                 e1 = v_final[:, 2] - v_final[:, 1]
                 e2 = v_final[:, 3] - v_final[:, 2]
                 e3 = v_final[:, 0] - v_final[:, 3]
+
                 c0 = e0[:,0]*e1[:,1] - e0[:,1]*e1[:,0]
                 c1 = e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0]
                 c2 = e2[:,0]*e3[:,1] - e2[:,1]*e3[:,0]
                 c3 = e3[:,0]*e0[:,1] - e3[:,1]*e0[:,0]
                 v_loss_convex = (F.relu(-c0) + F.relu(-c1) + F.relu(-c2) + F.relu(-c3)).mean()
 
-                # 4. Corner Separation Loss
                 dist_matrix = torch.cdist(v_final, v_final)
                 mask = torch.eye(4, dtype=torch.bool, device=dist_matrix.device).unsqueeze(0)
                 dist_matrix = dist_matrix.masked_fill(mask, 999.0)
                 v_loss_sep = F.relu(0.1 - dist_matrix).mean()
 
-                v_loss = 1.0 * v_loss_heatmap + 0.1 * v_loss_convex + 0.05 * v_loss_sep
+                v_loss = v_loss_heatmap + v_loss_coords + 0.05 * v_loss_convex + 0.05 * v_loss_sep
                 losses.append(v_loss.item())
                 val_preds.append(v_final.detach().cpu())
                 
@@ -279,19 +263,17 @@ def main() -> None:
                     
                     # Extract Metadata
                     crop_box = meta['crop_box'][b] # [x1, y1, x2, y2]
-                    scale = meta['scale'][b]
-                    padding = meta['padding'][b] # [pad_x, pad_y]
-                    in_size = meta['input_size'][b]
+                    px1, py1, px2, py2 = crop_box
+                    crop_w = px2 - px1
+                    crop_h = py2 - py1
                     
                     def inverse_map(pts_norm):
-                        # 1. Normalized -> Padded-input pixels
-                        pts_px = pts_norm * in_size
-                        # 2. Unpad -> Resized crop pixels
-                        pts_resized = pts_px - padding
-                        # 3. Scale -> Crop pixels
-                        pts_crop = pts_resized / scale
-                        # 4. Offset -> Original pixels
-                        return pts_crop + crop_box[:2]
+                        # Simple linear mapping for tight rectangular RoI
+                        # 1. Normalized -> RoI pixels
+                        kx = pts_norm[:, 0] * crop_w
+                        ky = pts_norm[:, 1] * crop_h
+                        # 2. Offset -> Original pixels
+                        return torch.stack([kx + px1, ky + py1], dim=-1)
 
                     p_orig = inverse_map(p_norm)
                     t_orig = inverse_map(t_norm)
@@ -304,6 +286,7 @@ def main() -> None:
                         'pred': p_norm,
                         'gt': t_norm,
                         'raw_peaks': raw_peaks[b].cpu(),
+                        'heatmaps': v_heatmaps[b].cpu(),
                         'path': batch['img_path'][b]
                     })
 
@@ -337,14 +320,12 @@ def main() -> None:
         scheduler.step()
 
         # Save Visualizations for Top Losses
-        from refiner.test import save_refiner_visualization
         epoch_vis_dir = os.path.join(vis_dir, f"epoch_{epoch+1:03d}")
         os.makedirs(epoch_vis_dir, exist_ok=True)
         for sample in top_tracker.get_samples():
-            save_refiner_visualization(
+            save_refiner_global_debug(
                 sample['image'], sample['pred'], sample['gt'],
-                sample['path'], epoch_vis_dir,
-                args.input_size, raw_peaks=sample['raw_peaks']
+                sample['heatmaps'], sample['path'], epoch_vis_dir
             )
         
         # Checkpoints based on Mean Error
