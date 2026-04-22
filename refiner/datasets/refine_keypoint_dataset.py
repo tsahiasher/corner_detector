@@ -126,12 +126,25 @@ class FullCardRefinerDataset(Dataset):
             
         ordered_kpts = self.reorder_corners(transformed_kpts)
         
+        # 5. Tight Card ROI Box relative to the Input Image (Crop)
+        # The Stage 1 box (cx, cy, w, h) before margin expansion.
+        r_x1 = (cx - w/2) * orig_w - px1
+        r_y1 = (cy - h/2) * orig_h - py1
+        r_x2 = (cx + w/2) * orig_w - px1
+        r_y2 = (cy + h/2) * orig_h - py1
+        
+        # Scale to input resolution
+        scale_x = self.input_size[0] / crop_w
+        scale_y = self.input_size[1] / crop_h
+        roi_box = torch.tensor([r_x1 * scale_x, r_y1 * scale_y, r_x2 * scale_x, r_y2 * scale_y], dtype=torch.float32)
+        
         return {
             'image': img_t,
             'targets': torch.from_numpy(ordered_kpts), 
             'img_path': img_path,
             'metadata': {
                 'crop_box': torch.tensor([px1, py1, px2, py2], dtype=torch.float32),
+                'roi_box': roi_box,
                 'input_size': torch.tensor(self.input_size, dtype=torch.float32)
             }
         }

@@ -167,42 +167,39 @@ def main() -> None:
             targets = batch['targets'] # [B, 4, 2] normalized in crop
 
             optimizer.zero_grad()
-            pred_final, pred_heatmaps = model(images)
+            # pred_coarse, pred_refined: [B, 4, 2] in full input space (Crop)
+            # pred_heatmaps: [B, 4, 112, 112] in RoI space
+            # roi_boxes: the RoI actually used for training (GT-based)
+            # pred_roi_boxes: what the model would have used at inference
+            pred_coarse, pred_refined, pred_heatmaps, roi_boxes, pred_roi_boxes = model(images, gt_pts=targets)
 
-            loss_heatmap = focal_criterion(pred_heatmaps, targets)
-            loss_coords = F.smooth_l1_loss(pred_final, targets)
+            # 1. Coarse Loss
+            loss_coarse = F.smooth_l1_loss(pred_coarse, targets)
+            
+            # 2. Refined Loss
+            loss_refined = F.smooth_l1_loss(pred_refined, targets)
+            
+            # 3. Heatmap Loss (Uses RoI-local targets from DYNAMIC ROI)
+            in_w = batch['metadata']['input_size'][:, 0].view(-1, 1, 1)
+            in_h = batch['metadata']['input_size'][:, 1].view(-1, 1, 1)
+            roi_x1 = roi_boxes[:, 0].view(-1, 1, 1)
+            roi_y1 = roi_boxes[:, 1].view(-1, 1, 1)
+            roi_w = (roi_boxes[:, 2] - roi_boxes[:, 0]).view(-1, 1, 1)
+            roi_h = (roi_boxes[:, 3] - roi_boxes[:, 1]).view(-1, 1, 1)
 
-            e0 = pred_final[:, 1] - pred_final[:, 0]
-            e1 = pred_final[:, 2] - pred_final[:, 1]
-            e2 = pred_final[:, 3] - pred_final[:, 2]
-            e3 = pred_final[:, 0] - pred_final[:, 3]
+            targets_roi_x = (targets[:, :, 0:1] * in_w - roi_x1) / torch.clamp(roi_w, min=1.0)
+            targets_roi_y = (targets[:, :, 1:2] * in_h - roi_y1) / torch.clamp(roi_h, min=1.0)
+            targets_roi = torch.cat([targets_roi_x, targets_roi_y], dim=-1)
 
-            c0 = e0[:,0]*e1[:,1] - e0[:,1]*e1[:,0]
-            c1 = e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0]
-            c2 = e2[:,0]*e3[:,1] - e2[:,1]*e3[:,0]
-            c3 = e3[:,0]*e0[:,1] - e3[:,1]*e0[:,0]
-            loss_convex = (F.relu(-c0) + F.relu(-c1) + F.relu(-c2) + F.relu(-c3)).mean()
+            loss_heatmap = focal_criterion(pred_heatmaps, targets_roi)
 
-            dist_matrix = torch.cdist(pred_final, pred_final)
-            mask = torch.eye(4, dtype=torch.bool, device=dist_matrix.device).unsqueeze(0)
-            dist_matrix = dist_matrix.masked_fill(mask, 999.0)
-            loss_sep = F.relu(0.1 - dist_matrix).mean()
-
-            loss = loss_heatmap + loss_coords + 0.05 * loss_convex + 0.05 * loss_sep
+            loss = 1.0 * loss_coarse + 1.0 * loss_refined + 1.0 * loss_heatmap
             
             loss.backward()
             optimizer.step()
 
-            # Collapse Metric: average pairwise distance
-            with torch.no_grad():
-                pw_0, pw_1, pw_2, pw_3 = pred_final[:, 0], pred_final[:, 1], pred_final[:, 2], pred_final[:, 3]
-                pw_dists = [torch.norm(pw_0-pw_1, dim=1), torch.norm(pw_0-pw_2, dim=1), torch.norm(pw_0-pw_3, dim=1),
-                            torch.norm(pw_1-pw_2, dim=1), torch.norm(pw_1-pw_3, dim=1), torch.norm(pw_2-pw_3, dim=1)]
-                avg_pw_dist = torch.stack(pw_dists).mean().item()
-
             tracker.record_batch('train', loss.item(), sync_time() - batch_start, 
-                                 components={'heatmap': loss_heatmap.item(),
-                                             'pw_dist': avg_pw_dist})
+                                 components={'heatmap': loss_heatmap.item()})
             train_pbar.set_postfix({'loss': f"{loss.item():.5f}"})
         
         tracker.end_train_phase()
@@ -223,42 +220,56 @@ def main() -> None:
                 targets = batch['targets']
                 meta = batch['metadata']
                 
-                v_final, v_heatmaps = model(images)
-                v_loss_heatmap = focal_criterion(v_heatmaps, targets)
-                v_loss_coords = F.smooth_l1_loss(v_final, targets)
-
-                e0 = v_final[:, 1] - v_final[:, 0]
-                e1 = v_final[:, 2] - v_final[:, 1]
-                e2 = v_final[:, 3] - v_final[:, 2]
-                e3 = v_final[:, 0] - v_final[:, 3]
-
-                c0 = e0[:,0]*e1[:,1] - e0[:,1]*e1[:,0]
-                c1 = e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0]
-                c2 = e2[:,0]*e3[:,1] - e2[:,1]*e3[:,0]
-                c3 = e3[:,0]*e0[:,1] - e3[:,1]*e0[:,0]
-                v_loss_convex = (F.relu(-c0) + F.relu(-c1) + F.relu(-c2) + F.relu(-c3)).mean()
-
-                dist_matrix = torch.cdist(v_final, v_final)
-                mask = torch.eye(4, dtype=torch.bool, device=dist_matrix.device).unsqueeze(0)
-                dist_matrix = dist_matrix.masked_fill(mask, 999.0)
-                v_loss_sep = F.relu(0.1 - dist_matrix).mean()
-
-                v_loss = v_loss_heatmap + v_loss_coords + 0.05 * v_loss_convex + 0.05 * v_loss_sep
-                losses.append(v_loss.item())
-                val_preds.append(v_final.detach().cpu())
+                # v_coarse, v_refined: [B, 4, 2] in full input space (Crop)
+                # v_heatmaps: [B, 4, 112, 112] in RoI space
+                v_coarse, v_refined, v_heatmaps, v_roi_boxes, v_pred_roi_boxes = model(images)
                 
-                # Compute raw peaks for visualization
+                # 1. Heatmap Loss (RoI Space)
+                v_in_w = meta['input_size'][:, 0].view(-1, 1, 1)
+                v_in_h = meta['input_size'][:, 1].view(-1, 1, 1)
+                v_roi_x1 = v_roi_boxes[:, 0].view(-1, 1, 1)
+                v_roi_y1 = v_roi_boxes[:, 1].view(-1, 1, 1)
+                v_roi_w = (v_roi_boxes[:, 2] - v_roi_boxes[:, 0]).view(-1, 1, 1)
+                v_roi_h = (v_roi_boxes[:, 3] - v_roi_boxes[:, 1]).view(-1, 1, 1)
+
+                v_targets_roi_x = (targets[:, :, 0:1] * v_in_w - v_roi_x1) / torch.clamp(v_roi_w, min=1.0)
+                v_targets_roi_y = (targets[:, :, 1:2] * v_in_h - v_roi_y1) / torch.clamp(v_roi_h, min=1.0)
+                v_targets_roi = torch.cat([v_targets_roi_x, v_targets_roi_y], dim=-1)
+
+                v_loss_heatmap = focal_criterion(v_heatmaps, v_targets_roi)
+                v_loss_coarse = F.smooth_l1_loss(v_coarse, targets)
+                v_loss_refined = F.smooth_l1_loss(v_refined, targets)
+
+                v_loss = v_loss_coarse + v_loss_refined + v_loss_heatmap
+                losses.append(v_loss.item())
+                val_preds.append(v_refined.detach().cpu())
+                
+                # Compute raw peaks for visualization (Map from RoI space to Crop space)
                 B_v, C_v, H_v, W_v = v_heatmaps.shape
                 v_heatmaps_flat = v_heatmaps.view(B_v, C_v, -1)
                 max_idx = torch.argmax(v_heatmaps_flat, dim=-1)
                 peak_y = max_idx // W_v
                 peak_x = max_idx % W_v
-                raw_peaks = torch.stack([(peak_x.float() + 0.5) / W_v, (peak_y.float() + 0.5) / H_v], dim=-1)
+                roi_peaks = torch.stack([(peak_x.float() + 0.5) / W_v, (peak_y.float() + 0.5) / H_v], dim=-1)
+                
+                # Metadata mapping (using DYNAMIC ROI)
+                v_roi_x1 = v_roi_boxes[:, 0].view(B_v, 1)
+                v_roi_y1 = v_roi_boxes[:, 1].view(B_v, 1)
+                v_roi_w = (v_roi_boxes[:, 2] - v_roi_boxes[:, 0]).view(B_v, 1)
+                v_roi_h = (v_roi_boxes[:, 3] - v_roi_boxes[:, 1]).view(B_v, 1)
+                
+                in_w = meta['input_size'][:, 0].view(B_v, 1)
+                in_h = meta['input_size'][:, 1].view(B_v, 1)
+                
+                final_peak_x = (roi_peaks[:, :, 0] * v_roi_w + v_roi_x1) / in_w
+                final_peak_y = (roi_peaks[:, :, 1] * v_roi_h + v_roi_y1) / in_h
+                raw_peaks = torch.stack([final_peak_x, final_peak_y], dim=-1)
                 
                 # EXACT Inverse Mapping to Original Pixel Coordinates
-                B = v_final.size(0)
+                B = v_refined.size(0)
                 for b in range(B):
-                    p_norm = v_final[b] # [4, 2] in [0, 1] padded input space
+                    p_norm = v_refined[b] # [4, 2] in [0, 1] input space
+                    p_coarse = v_coarse[b]
                     t_norm = targets[b]     # [4, 2]
                     
                     # Extract Metadata
@@ -268,11 +279,8 @@ def main() -> None:
                     crop_h = py2 - py1
                     
                     def inverse_map(pts_norm):
-                        # Simple linear mapping for tight rectangular RoI
-                        # 1. Normalized -> RoI pixels
                         kx = pts_norm[:, 0] * crop_w
                         ky = pts_norm[:, 1] * crop_h
-                        # 2. Offset -> Original pixels
                         return torch.stack([kx + px1, ky + py1], dim=-1)
 
                     p_orig = inverse_map(p_norm)
@@ -284,9 +292,12 @@ def main() -> None:
                     top_tracker.update(dist.mean().item(), {
                         'image': images[b],
                         'pred': p_norm,
+                        'pred_coarse': p_coarse,
                         'gt': t_norm,
                         'raw_peaks': raw_peaks[b].cpu(),
                         'heatmaps': v_heatmaps[b].cpu(),
+                        'roi_box': v_roi_boxes[b].cpu(),
+                        'pred_roi_box': v_pred_roi_boxes[b].cpu(),
                         'path': batch['img_path'][b]
                     })
 
@@ -295,19 +306,8 @@ def main() -> None:
         metrics = calculate_accuracy_metrics(all_errors)
         avg_val_loss = sum(losses) / len(losses)
         
-        # Validation Collapse Metric
-        all_pred_coords = torch.cat(val_preds, dim=0).to(device)
-        with torch.no_grad():
-            vpw_0 = all_pred_coords[:, 0]
-            vpw_1 = all_pred_coords[:, 1]
-            vpw_2 = all_pred_coords[:, 2]
-            vpw_3 = all_pred_coords[:, 3]
-            vpw_dists = [torch.norm(vpw_0-vpw_1, dim=1), torch.norm(vpw_0-vpw_2, dim=1), torch.norm(vpw_0-vpw_3, dim=1),
-                         torch.norm(vpw_1-vpw_2, dim=1), torch.norm(vpw_1-vpw_3, dim=1), torch.norm(vpw_2-vpw_3, dim=1)]
-            val_pw_dist = torch.stack(vpw_dists).mean().item()
-
         # Logging Summary Table
-        logger.info(f"LR: {current_lr:.6f} | PW Dist (T/V): {avg_pw_dist:.3f} / {val_pw_dist:.3f} | Size: {args.input_size}")
+        logger.info(f"LR: {current_lr:.6f} | Size: {args.input_size}")
         header = f"{'Phase':<15} | {'Loss':<10} | {'Mean (px)':<10} | {'<1px (%)':<10} | {'<2px (%)':<10} | {'<3px (%)':<10}"
         logger.info("-" * len(header))
         logger.info(header)
@@ -323,10 +323,13 @@ def main() -> None:
         epoch_vis_dir = os.path.join(vis_dir, f"epoch_{epoch+1:03d}")
         os.makedirs(epoch_vis_dir, exist_ok=True)
         for sample in top_tracker.get_samples():
-            save_refiner_global_debug(
-                sample['image'], sample['pred'], sample['gt'],
-                sample['heatmaps'], sample['path'], epoch_vis_dir
-            )
+                save_refiner_global_debug(
+                    sample['image'], sample['pred'], sample['gt'],
+                    sample['heatmaps'], sample['path'], epoch_vis_dir,
+                    roi_box=sample['roi_box'],
+                    coarse_corners=sample.get('pred_coarse'),
+                    pred_roi_box=sample.get('pred_roi_box')
+                )
         
         # Checkpoints based on Mean Error
         latest_path = os.path.join(run_dir, 'checkpoints', 'last.pt')

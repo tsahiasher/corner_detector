@@ -153,13 +153,16 @@ def save_refiner_global_debug(
     target_corners: torch.Tensor,
     heatmaps: torch.Tensor,
     img_path: str,
-    output_dir: str
+    output_dir: str,
+    roi_box: Optional[torch.Tensor] = None,
+    coarse_corners: Optional[torch.Tensor] = None,
+    pred_roi_box: Optional[torch.Tensor] = None
 ) -> None:
     """Saves a rich diagnostic image for Global Heatmap debugging.
     
     Shows:
-    1. Main image with GT, Pred (SoftArgmax), and Raw Heatmap Peaks.
-    2. The 4 individual heatmap channels.
+    1. Main image with GT, Coarse, Refined (SoftArgmax), and Raw Heatmap Peaks.
+    2. The 4 individual heatmap channels overlaid on RoI.
     """
     try:
         import cv2
@@ -180,13 +183,32 @@ def save_refiner_global_debug(
     B, C, H, W = heatmaps.shape
     heatmaps_sig = torch.sigmoid(heatmaps)
     
-    # [C, 2] in [0, 1] space (Argmax peaks)
+    # [C, 2] in [0, 1] RoI space (Argmax peaks)
     peaks_flat = heatmaps.view(C, -1).argmax(dim=-1)
-    peaks_y = (peaks_flat // W).float() / (H - 1)
-    peaks_x = (peaks_flat % W).float() / (W - 1)
-    peaks_np = torch.stack([peaks_x, peaks_y], dim=-1).cpu().numpy()
+    peaks_roi_y = (peaks_flat // W).float() / (H - 1)
+    peaks_roi_x = (peaks_flat % W).float() / (W - 1)
+    
+    # 3. Map RoI points to Image Pixels
+    if roi_box is not None:
+        r_x1, r_y1, r_x2, r_y2 = roi_box.cpu().numpy()
+        r_w, r_h = r_x2 - r_x1, r_y2 - r_y1
+        
+        # Raw Peaks: RoI [0,1] -> Image pixels
+        peaks_px_x = peaks_roi_x.cpu().numpy() * r_w + r_x1
+        peaks_px_y = peaks_roi_y.cpu().numpy() * r_h + r_y1
+        peaks_px = np.stack([peaks_px_x, peaks_px_y], axis=-1).astype(np.int32)
+        
+        # Draw ACTIVE ROI Box (Cyan)
+        cv2.rectangle(img, (int(r_x1), int(r_y1)), (int(r_x2), int(r_y2)), (255, 255, 0), 1)
+    else:
+        peaks_px = (torch.stack([peaks_roi_x, peaks_roi_y], dim=-1).cpu().numpy() * [w, h]).astype(np.int32)
 
-    # 3. Points for drawing
+    # Draw Predicted ROI Box (White thin)
+    if pred_roi_box is not None:
+        p_x1, p_y1, p_x2, p_y2 = pred_roi_box.cpu().numpy()
+        cv2.rectangle(img, (int(p_x1), int(p_y1)), (int(p_x2), int(p_y2)), (255, 255, 255), 1)
+
+    # 4. Points for drawing
     pred_np = pred_corners.cpu().numpy() if isinstance(pred_corners, torch.Tensor) else np.array(pred_corners)
     tgt_np = target_corners.cpu().numpy() if isinstance(target_corners, torch.Tensor) else np.array(target_corners)
     
@@ -195,11 +217,17 @@ def save_refiner_global_debug(
 
     pred_px = (pred_np * [w, h]).astype(np.int32)
     tgt_px = (tgt_np * [w, h]).astype(np.int32)
-    peaks_px = (peaks_np * [w, h]).astype(np.int32)
 
-    # 4. Draw on Main Image
+    # 5. Draw on Main Image
     # GT (Green)
     cv2.polylines(img, [tgt_px.reshape(-1, 1, 2)], True, (0, 255, 0), 2)
+    # Coarse (White, thin)
+    if coarse_corners is not None:
+        c_np = coarse_corners.cpu().numpy() if isinstance(coarse_corners, torch.Tensor) else np.array(coarse_corners)
+        if c_np.ndim == 3: c_np = c_np[0]
+        c_px = (c_np * [w, h]).astype(np.int32)
+        cv2.polylines(img, [c_px.reshape(-1, 1, 2)], True, (255, 255, 255), 1)
+
     # Pred SoftArgmax (Orange)
     cv2.polylines(img, [pred_px.reshape(-1, 1, 2)], True, (0, 165, 255), 2)
     
@@ -207,53 +235,43 @@ def save_refiner_global_debug(
     names = ["TL", "TR", "BR", "BL"]
     
     for i in range(4):
-        # GT point
-        cv2.circle(img, (int(tgt_px[i, 0]), int(tgt_px[i, 1])), 5, (0, 255, 0), -1)
-        # Pred SoftArgmax point
-        cv2.circle(img, (int(pred_px[i, 0]), int(pred_px[i, 1])), 5, (0, 165, 255), -1)
-        # Raw Peak point (Cross)
+        cv2.circle(img, (int(tgt_px[i, 0]), int(tgt_px[i, 1])), 4, (0, 255, 0), -1)
+        cv2.circle(img, (int(pred_px[i, 0]), int(pred_px[i, 1])), 4, (0, 165, 255), -1)
         px, py = int(peaks_px[i, 0]), int(peaks_px[i, 1])
-        cv2.line(img, (px - 8, py), (px + 8, py), colors[i], 2)
-        cv2.line(img, (px, py - 8), (px, py + 8), colors[i], 2)
-        
-        cv2.putText(img, names[i], (px + 10, py + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i], 2)
+        cv2.line(img, (px - 6, py), (px + 6, py), colors[i], 1)
+        cv2.line(img, (px, py - 6), (px, py + 6), colors[i], 1)
 
-    # 5. Create Heatmap Overlay Grid (2x2)
-    # Each cell shows the image with a single heatmap channel overlaid
+    # 6. Create Heatmap Overlay Grid (2x2)
     vis_strips = []
-    names = ["TL", "TR", "BR", "BL"]
-    colors = [(255, 0, 0), (0, 255, 255), (255, 0, 255), (0, 0, 255)] # Blue, Yellow, Magenta, Red
-    
     for i in range(4):
-        # Create base for this corner's visualization
         vis = img.copy()
-        
-        # Heatmap overlay
         hm = (heatmaps_sig[0, i].cpu().numpy() * 255).astype(np.uint8)
         hm_vis = cv2.applyColorMap(hm, cv2.COLORMAP_JET)
-        hm_vis = cv2.resize(hm_vis, (w, h))
         
-        # Alpha blend (50% heatmap, 50% image)
-        vis = cv2.addWeighted(vis, 0.5, hm_vis, 0.5, 0)
+        if roi_box is not None:
+            r_x1, r_y1, r_x2, r_y2 = map(int, roi_box.cpu().numpy())
+            r_x1, r_y1 = max(0, r_x1), max(0, r_y1)
+            r_x2, r_y2 = min(w, r_x2), min(h, r_y2)
+            rw, rh = r_x2 - r_x1, r_y2 - r_y1
+            if rw > 0 and rh > 0:
+                hm_roi = cv2.resize(hm_vis, (rw, rh))
+                roi_area = vis[r_y1:r_y2, r_x1:r_x2]
+                blended = cv2.addWeighted(roi_area, 0.5, hm_roi, 0.5, 0)
+                vis[r_y1:r_y2, r_x1:r_x2] = blended
+        else:
+            hm_vis = cv2.resize(hm_vis, (w, h))
+            vis = cv2.addWeighted(vis, 0.5, hm_vis, 0.5, 0)
         
-        # Draw GT, Pred, and Peak for this specific corner
-        # GT (Green circle)
-        cv2.circle(vis, (int(tgt_px[i, 0]), int(tgt_px[i, 1])), 6, (0, 255, 0), 2)
-        # Pred SoftArgmax (Orange circle)
-        cv2.circle(vis, (int(pred_px[i, 0]), int(pred_px[i, 1])), 6, (0, 165, 255), 2)
-        # Raw Peak (Cross in specific color)
+        cv2.circle(vis, (int(tgt_px[i, 0]), int(tgt_px[i, 1])), 5, (0, 255, 0), 2)
+        cv2.circle(vis, (int(pred_px[i, 0]), int(pred_px[i, 1])), 5, (0, 165, 255), 2)
         px, py = int(peaks_px[i, 0]), int(peaks_px[i, 1])
-        cv2.line(vis, (px - 10, py), (px + 10, py), colors[i], 2)
-        cv2.line(vis, (px, py - 10), (px, py + 10), colors[i], 2)
-        
-        # Corner label
-        cv2.putText(vis, f"Corner {i} ({names[i]})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
+        cv2.line(vis, (px - 8, py), (px + 8, py), colors[i], 2)
+        cv2.line(vis, (px, py - 8), (px, py + 8), colors[i], 2)
+        cv2.putText(vis, f"Corner {i} ({names[i]})", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         vis_strips.append(vis)
         
-    # Combine into 2x2 grid
     top = np.hstack([vis_strips[0], vis_strips[1]])
-    bottom = np.hstack([vis_strips[3], vis_strips[2]]) # Clockwise
+    bottom = np.hstack([vis_strips[3], vis_strips[2]])
     grid = np.vstack([top, bottom])
     
     os.makedirs(output_dir, exist_ok=True)
